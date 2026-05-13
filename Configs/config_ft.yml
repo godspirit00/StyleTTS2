@@ -5,6 +5,11 @@ device: "cuda"
 epochs: 50 # number of finetuning epoch (1 hour of data)
 batch_size: 8
 max_len: 400 # maximum number of frames
+# Dynamic batching: groups samples into length bins so every item in a batch
+# has the same padded length. Eliminates cross-sample clipping and avoids OOM
+# from variable-length batches. Per-bin batch sizes are auto-saved to
+# batch_sizes.json in log_dir; reduce individual entries to handle OOM bins.
+dynamic_batch: false
 pretrained_model: "Models/LibriTTS/epochs_2nd_00020.pth"
 second_stage_load_pretrained: true # set to true if the pre-trained model is for 2nd stage
 load_only_params: true # set to true if do not want to load epoch numbers and optimizer parameters

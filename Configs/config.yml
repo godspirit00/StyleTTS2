@@ -7,6 +7,11 @@ epochs_1st: 200 # number of epochs for first stage training (pre-training)
 epochs_2nd: 100 # number of peochs for second stage training (joint training)
 batch_size: 16
 max_len: 400 # maximum number of frames
+# Dynamic batching: groups samples into length bins so every item in a batch
+# has the same padded length. Eliminates cross-sample clipping and avoids OOM
+# from variable-length batches. Per-bin batch sizes are auto-saved to
+# batch_sizes.json in log_dir; reduce individual entries to handle OOM bins.
+dynamic_batch: false
 pretrained_model: ""
 second_stage_load_pretrained: true # set to true if the pre-trained model is for 2nd stage
 load_only_params: false # set to true if do not want to load epoch numbers and optimizer parameters

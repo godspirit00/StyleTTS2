@@ -80,15 +80,17 @@ def main(config_path):
     OOD_data = data_params['OOD_data']
 
     max_len = config.get('max_len', 200)
-    
+    dynamic_batch = config.get('dynamic_batch', False)
+
     loss_params = Munch(config['loss_params'])
     diff_epoch = loss_params.diff_epoch
     joint_epoch = loss_params.joint_epoch
-    
+
     optimizer_params = Munch(config['optimizer_params'])
-    
+
     train_list, val_list = get_data_path_list(train_path, val_path)
     device = 'cuda'
+    batch_size_file = osp.join(log_dir, 'batch_sizes.json')
 
     train_dataloader = build_dataloader(train_list,
                                         root_path,
@@ -97,7 +99,9 @@ def main(config_path):
                                         batch_size=batch_size,
                                         num_workers=2,
                                         dataset_config={},
-                                        device=device)
+                                        device=device,
+                                        dynamic_batch=dynamic_batch,
+                                        batch_size_file=batch_size_file)
 
     val_dataloader = build_dataloader(val_list,
                                       root_path,
@@ -349,6 +353,9 @@ def main(config_path):
                                                     s2s_attn_mono, 
                                                     text_mask)
                 
+            # With dynamic batching all mel_input_length values are equal, so
+            # mel_len == mel_input_length[0]/2 - 1 and random_start is always 0,
+            # meaning the full sample is used without cross-sample clipping.
             mel_len_st = int(mel_input_length.min().item() / 2 - 1)
             mel_len = min(int(mel_input_length.min().item() / 2 - 1), max_len // 2)
             en = []
@@ -543,7 +550,7 @@ def main(config_path):
             
             if (i+1)%log_interval == 0:
                 logger.info ('Epoch [%d/%d], Step [%d/%d], Loss: %.5f, Disc Loss: %.5f, Dur Loss: %.5f, CE Loss: %.5f, Norm Loss: %.5f, F0 Loss: %.5f, LM Loss: %.5f, Gen Loss: %.5f, Sty Loss: %.5f, Diff Loss: %.5f, DiscLM Loss: %.5f, GenLM Loss: %.5f, SLoss: %.5f, S2S Loss: %.5f, Mono Loss: %.5f'
-                    %(epoch+1, epochs, i+1, len(train_list)//batch_size, running_loss / log_interval, d_loss, loss_dur, loss_ce, loss_norm_rec, loss_F0_rec, loss_lm, loss_gen_all, loss_sty, loss_diff, d_loss_slm, loss_gen_lm, s_loss, loss_s2s, loss_mono))
+                    %(epoch+1, epochs, i+1, len(train_dataloader), running_loss / log_interval, d_loss, loss_dur, loss_ce, loss_norm_rec, loss_F0_rec, loss_lm, loss_gen_all, loss_sty, loss_diff, d_loss_slm, loss_gen_lm, s_loss, loss_s2s, loss_mono))
                 
                 writer.add_scalar('train/mel_loss', running_loss / log_interval, iters)
                 writer.add_scalar('train/gen_loss', loss_gen_all, iters)
