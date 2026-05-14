@@ -22,7 +22,7 @@ import torchaudio
 import librosa
 
 from models import *
-from meldataset import build_dataloader
+from meldataset import build_dataloader, get_bin_from_mel_input_length
 from utils import *
 from losses import *
 from optimizers import build_optimizer
@@ -338,6 +338,14 @@ def main(config_path):
                     log_print('WARNING: OOM at step %d, skipping batch' % i, logger)
                     torch.cuda.empty_cache()
                     optimizer.zero_grad()
+                    if dynamic_batch and train_dataloader.batch_manager is not None:
+                        try:
+                            _bin = get_bin_from_mel_input_length(mel_input_length)
+                            if train_dataloader.batch_manager.decrement(_bin):
+                                log_print('Reduced batch size for bin %d to %d' % (
+                                    _bin, train_dataloader.batch_manager.get(_bin)), logger)
+                        except (NameError, UnboundLocalError):
+                            pass
                 else:
                     raise
                                 

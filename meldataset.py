@@ -91,6 +91,17 @@ def get_frame_count(bin_id):
     """
     return bin_id * 20 + 60
 
+def get_bin_from_mel_input_length(mel_input_length):
+    """Recover the bin id from a batch's padded mel-frame tensor.
+
+    With dynamic batching every sample in a batch has the same padded length
+    equal to get_frame_count(bin_id) = 60 + 20*bin_id.  Inverting:
+        bin_id = (frame_count - 60) // 20
+    Safe to call even if mel_input_length has minor rounding; always >= 0.
+    """
+    frame_count = int(mel_input_length.min().item())
+    return max(0, (frame_count - 60) // 20)
+
 
 class BatchManager:
     """Persists per-bin batch sizes in a JSON file.
@@ -167,6 +178,87 @@ class DynamicBatchSampler(torch.utils.data.Sampler):
             len(v) // self.batch_manager.get(k)
             for k, v in self.bins.items()
         )
+
+
+# ---------------------------------------------------------------------------
+# Batch-size probe
+# ---------------------------------------------------------------------------
+
+def probe_batch_sizes(dataset, batch_manager, test_fn, vram_reserve_mb=512, logger=None):
+    """Calibrate per-bin batch sizes before training starts.
+
+    Iterates bins from shortest to longest.  For each bin calls *test_fn(batch)*
+    (a full forward+backward training step) with the current batch size.  On OOM
+    the batch size is decremented and the step is retried; bins that still OOM at
+    batch_size=1 are set to 0 (skipped during training).  Results are persisted
+    to ``batch_manager.json_path`` so subsequent runs reuse them.
+
+    Args:
+        dataset:          A :class:`FilePathDataset` with ``dynamic_batch=True``
+                          (i.e. ``sample_bins`` already populated).
+        batch_manager:    The :class:`BatchManager` whose sizes will be updated.
+        test_fn:          ``callable(batch) -> None`` — runs one training step.
+                          Should raise ``RuntimeError`` on OOM.
+        vram_reserve_mb:  MiB to pre-allocate before probing so that estimates
+                          are conservative (real training has other overhead).
+        logger:           Optional logger for progress messages.
+    """
+    import gc
+    from collections import defaultdict
+
+    _log = (lambda msg: logger.info(msg)) if logger else (lambda msg: None)
+
+    # Group indices by bin
+    bins = defaultdict(list)
+    for idx, bin_id in enumerate(dataset.sample_bins):
+        bins[bin_id].append(idx)
+
+    # Reserve VRAM so probe estimates are conservative
+    reserve = None
+    if vram_reserve_mb > 0:
+        n_elems = vram_reserve_mb * 1024 * 1024 // 4  # float32
+        try:
+            reserve = torch.zeros(n_elems, dtype=torch.float32, device='cuda')
+            _log(f'Probe: reserved {vram_reserve_mb} MiB of VRAM')
+        except RuntimeError:
+            _log('Probe: could not reserve VRAM, probing without reserve')
+
+    collate_fn = Collater()
+
+    for bin_id in sorted(bins.keys()):
+        indices = bins[bin_id]
+        while True:
+            bs = batch_manager.get(bin_id)
+            if bs == 0:
+                _log(f'Probe: bin {bin_id} marked as skip')
+                break
+            if len(indices) < bs:
+                _log(f'Probe: bin {bin_id} has fewer samples than batch_size={bs}, keeping as-is')
+                break
+            try:
+                batch = collate_fn([dataset[i] for i in indices[:bs]])
+                test_fn(batch)
+                _log(f'Probe: bin {bin_id} -> batch_size={bs} OK')
+                break
+            except RuntimeError as e:
+                if 'out of memory' not in str(e).lower():
+                    raise
+                torch.cuda.empty_cache()
+                gc.collect()
+                _log(f'Probe: bin {bin_id} OOM at batch_size={bs}')
+                if not batch_manager.decrement(bin_id):
+                    # Already at 1 and still OOM — skip this bin
+                    batch_manager.set(bin_id, 0)
+                    _log(f'Probe: bin {bin_id} skipped (batch_size=1 still OOMs)')
+                    break
+
+    if reserve is not None:
+        del reserve
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    batch_manager._save()
+    _log('Probe complete — batch_sizes.json updated')
 
 
 # ---------------------------------------------------------------------------

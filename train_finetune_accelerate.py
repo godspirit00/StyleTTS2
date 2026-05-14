@@ -15,7 +15,7 @@ import warnings
 warnings.simplefilter('ignore')
 from torch.utils.tensorboard import SummaryWriter
 
-from meldataset import build_dataloader
+from meldataset import build_dataloader, get_bin_from_mel_input_length
 
 from Utils.ASR.models import ASRCNN
 from Utils.JDC.model import JDCNet
@@ -588,9 +588,17 @@ def main(config_path):
                     logger.warning('WARNING: OOM at step %d, skipping batch' % i)
                     torch.cuda.empty_cache()
                     optimizer.zero_grad()
+                    if dynamic_batch and train_dataloader.batch_manager is not None:
+                        try:
+                            _bin = get_bin_from_mel_input_length(mel_input_length)
+                            if train_dataloader.batch_manager.decrement(_bin):
+                                logger.info('Reduced batch size for bin %d to %d' % (
+                                    _bin, train_dataloader.batch_manager.get(_bin)))
+                        except (NameError, UnboundLocalError):
+                            pass
                 else:
                     raise
-            
+
         loss_test = 0
         loss_align = 0
         loss_f = 0
