@@ -181,6 +181,9 @@ def main(config_path):
 
         _ = [model[key].train() for key in model]
 
+        if epoch == TMA_epoch:
+            log_print('Epoch %d: text aligner and pitch extractor joining training — VRAM usage will increase' % epoch, logger)
+
         for i, batch in enumerate(train_dataloader):
             try:
                 waves = batch[0]
