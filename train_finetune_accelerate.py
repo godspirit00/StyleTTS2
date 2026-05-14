@@ -107,6 +107,11 @@ def main(config_path):
                                         dynamic_batch=dynamic_batch,
                                         batch_size_file=batch_size_file)
 
+    # Keep a reference to the BatchManager before accelerator.prepare wraps
+    # the dataloader in a DataLoaderShard, which does not preserve the custom
+    # batch_manager attribute set in build_dataloader.
+    batch_manager = train_dataloader.batch_manager
+
     val_dataloader = build_dataloader(val_list,
                                       root_path,
                                       OOD_data=OOD_data,
@@ -588,12 +593,12 @@ def main(config_path):
                     logger.warning('WARNING: OOM at step %d, skipping batch' % i)
                     torch.cuda.empty_cache()
                     optimizer.zero_grad()
-                    if dynamic_batch and train_dataloader.batch_manager is not None:
+                    if dynamic_batch and batch_manager is not None:
                         try:
                             _bin = get_bin_from_mel_input_length(mel_input_length)
-                            if train_dataloader.batch_manager.decrement(_bin):
+                            if batch_manager.decrement(_bin):
                                 logger.info('Reduced batch size for bin %d to %d' % (
-                                    _bin, train_dataloader.batch_manager.get(_bin)))
+                                    _bin, batch_manager.get(_bin)))
                         except (NameError, UnboundLocalError):
                             pass
                 else:
