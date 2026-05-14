@@ -131,6 +131,10 @@ def main(config_path):
     multispeaker = model_params.multispeaker
     model = build_model(model_params, text_aligner, pitch_extractor, plbert)
     _ = [model[key].to(device) for key in model]
+
+    # text_aligner is kept frozen during fine-tuning to preserve pretrained ASR alignment
+    for p in model.text_aligner.parameters():
+        p.requires_grad = False
     
     # DP
     for key in model:
@@ -188,28 +192,23 @@ def main(config_path):
         "steps_per_epoch": len(train_dataloader),
     }
     scheduler_params_dict= {key: scheduler_params.copy() for key in model}
-    scheduler_params_dict['bert']['max_lr'] = optimizer_params.bert_lr * 2
-    scheduler_params_dict['decoder']['max_lr'] = optimizer_params.ft_lr * 2
-    scheduler_params_dict['style_encoder']['max_lr'] = optimizer_params.ft_lr * 2
-    
+    # Per-module peak LRs; the OneCycleLR schedule warms up to max_lr then decays.
+    scheduler_params_dict['bert']['max_lr'] = optimizer_params.bert_lr
+    scheduler_params_dict['decoder']['max_lr'] = optimizer_params.ft_lr
+    scheduler_params_dict['style_encoder']['max_lr'] = optimizer_params.ft_lr
+
     optimizer = build_optimizer({key: model[key].parameters() for key in model},
                                           scheduler_params_dict=scheduler_params_dict, lr=optimizer_params.lr)
-    
-    # adjust BERT learning rate
+
+    # adjust BERT AdamW hyperparams (lr is managed by the scheduler via max_lr above)
     for g in optimizer.optimizers['bert'].param_groups:
         g['betas'] = (0.9, 0.99)
-        g['lr'] = optimizer_params.bert_lr
-        g['initial_lr'] = optimizer_params.bert_lr
-        g['min_lr'] = 0
         g['weight_decay'] = 0.01
-        
-    # adjust acoustic module learning rate
+
+    # adjust acoustic module AdamW hyperparams
     for module in ["decoder", "style_encoder"]:
         for g in optimizer.optimizers[module].param_groups:
             g['betas'] = (0.0, 0.99)
-            g['lr'] = optimizer_params.ft_lr
-            g['initial_lr'] = optimizer_params.ft_lr
-            g['min_lr'] = 0
             g['weight_decay'] = 1e-4
         
     # load models if there is a model
@@ -556,6 +555,11 @@ def main(config_path):
                             optimizer.zero_grad()
                             d_loss_slm.backward(retain_graph=True)
                             optimizer.step('wd')
+
+                # Advance the OneCycleLR schedule once per training iteration so
+                # the warmup-then-cosine-decay configured in scheduler_params
+                # actually takes effect.
+                optimizer.scheduler()
 
                 iters = iters + 1
 
