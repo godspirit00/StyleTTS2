@@ -181,7 +181,9 @@ def main(config_path):
     
     scheduler_params = {
         "max_lr": optimizer_params.lr,
-        "pct_start": float(0),
+        "pct_start": float(0.1),     # 10% warmup then cosine decay
+        "div_factor": 10.0,          # start at max_lr / 10
+        "final_div_factor": 100.0,   # end at initial_lr / 100 (= max_lr / 1000)
         "epochs": epochs,
         "steps_per_epoch": len(train_dataloader),
     }
@@ -250,7 +252,6 @@ def main(config_path):
 
         _ = [model[key].eval() for key in model]
         
-        model.text_aligner.train()
         model.text_encoder.train()
         
         model.predictor.train()
@@ -470,6 +471,9 @@ def main(config_path):
 
                 running_loss += loss_mel.item()
                 g_loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    [p for key in model for p in model[key].parameters() if p.requires_grad],
+                    max_norm=5.0)
                 if torch.isnan(g_loss):
                     from IPython.core.debugger import set_trace
                     set_trace()
@@ -482,7 +486,6 @@ def main(config_path):
                 optimizer.step('decoder')
 
                 optimizer.step('text_encoder')
-                optimizer.step('text_aligner')
 
                 if epoch >= diff_epoch:
                     optimizer.step('diffusion')
