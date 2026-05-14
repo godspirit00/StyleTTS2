@@ -100,17 +100,17 @@ loss_params:
     lambda_F0: 1. # F0 reconstruction loss
     lambda_norm: 1. # norm reconstruction loss
     lambda_dur: 1. # duration loss
-    lambda_ce: 20. # duration predictor probability output CE loss
+    lambda_ce: 10. # duration predictor probability output CE loss
     lambda_sty: 1. # style reconstruction loss
     lambda_diff: 1. # score matching loss
-    
-    diff_epoch: 10 # style diffusion starting epoch
-    joint_epoch: 30 # joint training starting epoch
+
+    diff_epoch: 15 # style diffusion starting epoch
+    joint_epoch: 40 # joint SLM adversarial training starting epoch; set > epochs to disable for very small datasets
 
 optimizer_params:
   lr: 0.0001 # general learning rate
   bert_lr: 0.00001 # learning rate for PLBERT
-  ft_lr: 0.0001 # learning rate for acoustic modules
+  ft_lr: 0.00005 # learning rate for acoustic modules; lower is better for small datasets
   
 slmadv_params:
   min_len: 400 # minimum length of samples
