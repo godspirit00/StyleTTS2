@@ -134,7 +134,10 @@ class JDCNet(nn.Module):
         # sizes: (b, 31, 722), (b, 31, 2)
         # classifier output consists of predicted pitch classes per frame
         # detector output consists of: (isvoice, notvoice) estimates per frame
-        return torch.abs(classifier_out.squeeze()), GAN_feature, poolblock_out
+        # squeeze only the trailing num_class dim: a bare squeeze() also
+        # collapses the batch dim when batch_size == 1, which corrupts
+        # downstream conv1d inputs.
+        return torch.abs(classifier_out.squeeze(-1)), GAN_feature, poolblock_out
 
     @staticmethod
     def init_weights(m):
