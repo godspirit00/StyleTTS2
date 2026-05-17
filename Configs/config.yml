@@ -26,10 +26,12 @@ load_only_params: false # set to true if do not want to load epoch numbers and o
 # ---------------------------------------------------------------------------
 # VRAM / speed knobs (optional — defaults preserve original behaviour).
 # ---------------------------------------------------------------------------
-# mixed_precision: 'no' | 'bf16' | 'fp16'. bf16 is recommended on Ampere+ GPUs
+# mixed_precision: 'no' | 'bf16'. bf16 is recommended on Ampere+ GPUs
 #   (A100, RTX 30/40, H100) and roughly halves activation VRAM with negligible
-#   accuracy impact. fp16 is supported but lacks GradScaler integration in the
-#   stage-2 multi-backward loop, so prefer bf16 when available.
+#   accuracy impact. fp16 is only accepted by the Accelerate-based scripts
+#   (train_first.py / train_finetune_accelerate.py); train_second.py and
+#   train_finetune.py will reject 'fp16' because their multi-backward loops
+#   do not wire up a GradScaler.
 mixed_precision: 'no'
 # gradient_checkpointing: enables checkpointing inside the diffusion
 #   transformer blocks (Modules/diffusion/modules.py). Cuts activation memory

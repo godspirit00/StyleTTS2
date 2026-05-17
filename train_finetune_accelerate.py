@@ -33,7 +33,9 @@ from utils import enable_diffusion_gradient_checkpointing
 
 from accelerate import Accelerator
 
-accelerator = Accelerator()
+# Accelerator is constructed inside main() so it can read mixed_precision from
+# the config; the placeholder here just keeps module-level references valid.
+accelerator = None
 
 # simple fix for dataparallel that allows access to class attributes
 class MyDataParallel(torch.nn.DataParallel):
@@ -55,8 +57,15 @@ logger.addHandler(handler)
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config_ft.yml', type=str)
 def main(config_path):
+    global accelerator
     config = yaml.safe_load(open(config_path))
-    
+
+    # Accelerate handles AMP itself; "no" / "fp16" / "bf16" all valid.
+    mixed_precision = config.get('mixed_precision', 'no')
+    if isinstance(mixed_precision, bool):
+        mixed_precision = 'no' if not mixed_precision else 'fp16'
+    accelerator = Accelerator(mixed_precision=mixed_precision)
+
     log_dir = config['log_dir']
     if not osp.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
@@ -325,8 +334,10 @@ def main(config_path):
                 except Exception:
                     continue
 
-                mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
-                s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
+                # maximum_path/.numpy() do not accept bf16; cast back to fp32.
+                with torch.cuda.amp.autocast(enabled=False):
+                    mask_ST = mask_from_lens(s2s_attn.float(), input_lengths, mel_input_length // (2 ** n_down))
+                    s2s_attn_mono = maximum_path(s2s_attn.float(), mask_ST)
 
                 # encode
                 t_en = model.text_encoder(texts, input_lengths, text_mask)
@@ -469,7 +480,9 @@ def main(config_path):
 
                 loss_mel = stft_loss(y_rec, wav)
                 loss_gen_all = gl(wav, y_rec).mean()
-                loss_lm = wl(wav.detach().squeeze(), y_rec.squeeze()).mean()
+                # WavLM is frozen+eval; keep it in fp32 under AMP for stability.
+                with torch.cuda.amp.autocast(enabled=False):
+                    loss_lm = wl(wav.detach().float().squeeze(), y_rec.float().squeeze()).mean()
 
                 loss_ce = 0
                 loss_dur = 0
@@ -654,8 +667,9 @@ def main(config_path):
                         s2s_attn = s2s_attn[..., 1:]
                         s2s_attn = s2s_attn.transpose(-1, -2)
 
-                        mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
-                        s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
+                        with torch.cuda.amp.autocast(enabled=False):
+                            mask_ST = mask_from_lens(s2s_attn.float(), input_lengths, mel_input_length // (2 ** n_down))
+                            s2s_attn_mono = maximum_path(s2s_attn.float(), mask_ST)
 
                         # encode
                         t_en = model.text_encoder(texts, input_lengths, text_mask)
