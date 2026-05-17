@@ -290,7 +290,10 @@ def main(config_path):
 
                 # generator loss
                 optimizer.zero_grad()
-                loss_mel = stft_loss(y_rec.squeeze(), wav.detach())
+                # squeeze only the channel dim: a bare squeeze() also collapses
+                # the batch dim when batch_size == 1, which makes the STFT loss
+                # see a 1-D tensor and crash inside cuFFT (CUFFT_INTERNAL_ERROR).
+                loss_mel = stft_loss(y_rec.squeeze(1), wav.detach())
 
                 if epoch >= TMA_epoch: # start TMA training
                     loss_s2s = 0
@@ -419,7 +422,7 @@ def main(config_path):
                 real_norm = log_norm(gt.unsqueeze(1)).squeeze(1)
                 y_rec = model.decoder(en, F0_real, real_norm, s)
 
-                loss_mel = stft_loss(y_rec.squeeze(), wav.detach())
+                loss_mel = stft_loss(y_rec.squeeze(1), wav.detach())
 
                 loss_test += accelerator.gather(loss_mel).mean().item()
                 iters_test += 1
