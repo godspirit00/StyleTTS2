@@ -23,6 +23,34 @@ pretrained_model: ""
 second_stage_load_pretrained: true # set to true if the pre-trained model is for 2nd stage
 load_only_params: false # set to true if do not want to load epoch numbers and optimizer parameters
 
+# ---------------------------------------------------------------------------
+# VRAM / speed knobs (optional — defaults preserve original behaviour).
+# ---------------------------------------------------------------------------
+# mixed_precision: 'no' | 'bf16' | 'fp16'. bf16 is recommended on Ampere+ GPUs
+#   (A100, RTX 30/40, H100) and roughly halves activation VRAM with negligible
+#   accuracy impact. fp16 is supported but lacks GradScaler integration in the
+#   stage-2 multi-backward loop, so prefer bf16 when available.
+mixed_precision: 'no'
+# gradient_checkpointing: enables checkpointing inside the diffusion
+#   transformer blocks (Modules/diffusion/modules.py). Cuts activation memory
+#   at the cost of one extra forward pass per block during backward.
+gradient_checkpointing: false
+# use_8bit_optimizer: use bitsandbytes.optim.AdamW8bit (~4x smaller optimizer
+#   state). Requires `pip install bitsandbytes`; falls back to standard AdamW
+#   when not installed.
+use_8bit_optimizer: false
+# disc_update_freq: update mpd/msd (and SLM wd in joint training) every N
+#   generator steps. 1 = every step (default); 2 means train discriminators
+#   every other step (halves their compute/VRAM contribution).
+disc_update_freq: 1
+# diffusion_num_steps_min / _max: number of diffusion sampler steps drawn per
+#   training iteration (randint(min, max)). The original code used (3, 5);
+#   lowering both to e.g. 2,3 cuts per-step diffusion cost noticeably.
+diffusion_num_steps_min: 3
+diffusion_num_steps_max: 5
+# num_workers: DataLoader worker processes (per-rank when using Accelerate).
+num_workers: 2
+
 F0_path: "Utils/JDC/bst.t7"
 ASR_config: "Utils/ASR/config.yml"
 ASR_path: "Utils/ASR/epoch_00080.pth"

@@ -24,6 +24,10 @@ from Utils.PLBERT.util import load_plbert
 from models import *
 from losses import *
 from utils import *
+from utils import (
+    resolve_amp_dtype,
+    enable_diffusion_gradient_checkpointing,
+)
 
 from Modules.slmadv import SLMAdversarialLoss
 from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSchedule
@@ -82,6 +86,20 @@ def main(config_path):
     max_len = config.get('max_len', 200)
     dynamic_batch = config.get('dynamic_batch', False)
 
+    # VRAM/speed-related options (all optional, defaults preserve old behaviour).
+    mixed_precision = config.get('mixed_precision', 'no')
+    grad_checkpoint = config.get('gradient_checkpointing', False)
+    num_workers = int(config.get('num_workers', 2))
+    use_8bit_optim = config.get('use_8bit_optimizer', False)
+    disc_update_freq = max(1, int(config.get('disc_update_freq', 1)))
+    diff_num_steps_min = int(config.get('diffusion_num_steps_min', 3))
+    diff_num_steps_max = int(config.get('diffusion_num_steps_max', 5))
+    if diff_num_steps_max <= diff_num_steps_min:
+        diff_num_steps_max = diff_num_steps_min + 1
+
+    amp_enabled, amp_dtype, use_scaler = resolve_amp_dtype(mixed_precision)
+    enable_diffusion_gradient_checkpointing(grad_checkpoint)
+
     loss_params = Munch(config['loss_params'])
     diff_epoch = loss_params.diff_epoch
     joint_epoch = loss_params.joint_epoch
@@ -97,7 +115,7 @@ def main(config_path):
                                         OOD_data=OOD_data,
                                         min_length=min_length,
                                         batch_size=batch_size,
-                                        num_workers=2,
+                                        num_workers=num_workers,
                                         dataset_config={},
                                         device=device,
                                         dynamic_batch=dynamic_batch,
@@ -132,10 +150,16 @@ def main(config_path):
     model = build_model(model_params, text_aligner, pitch_extractor, plbert)
     _ = [model[key].to(device) for key in model]
 
-    # text_aligner is kept frozen during fine-tuning to preserve pretrained ASR alignment
+    # text_aligner is kept frozen during fine-tuning to preserve pretrained ASR alignment.
+    # pitch_extractor is also used purely as an inference module here.  Freeze both
+    # to avoid wasting VRAM on optimizer state for parameters that never receive grads.
     for p in model.text_aligner.parameters():
         p.requires_grad = False
-    
+    for p in model.pitch_extractor.parameters():
+        p.requires_grad = False
+    model.text_aligner.eval()
+    model.pitch_extractor.eval()
+
     # DP
     for key in model:
         if key != "mpd" and key != "msd" and key != "wd":
@@ -198,7 +222,11 @@ def main(config_path):
     scheduler_params_dict['style_encoder']['max_lr'] = optimizer_params.ft_lr
 
     optimizer = build_optimizer({key: model[key].parameters() for key in model},
-                                          scheduler_params_dict=scheduler_params_dict, lr=optimizer_params.lr)
+                                          scheduler_params_dict=scheduler_params_dict, lr=optimizer_params.lr,
+                                          use_8bit=use_8bit_optim)
+    if amp_enabled and use_scaler:
+        logger.warning("mixed_precision='fp16' selected but GradScaler is not wired "
+                       "into the fine-tune multi-backward loop; bf16 is recommended.")
 
     # adjust BERT AdamW hyperparams (lr is managed by the scheduler via max_lr above)
     for g in optimizer.optimizers['bert'].param_groups:
@@ -275,7 +303,7 @@ def main(config_path):
                 waves = batch[0]
                 batch = [b.to(device) for b in batch[1:]]
                 texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
-                with torch.no_grad():
+                with torch.no_grad(), torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
                     mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
                     mel_mask = length_to_mask(mel_input_length).to(device)
                     text_mask = length_to_mask(input_lengths).to(texts.device)
@@ -287,73 +315,77 @@ def main(config_path):
                         ref = torch.cat([ref_ss, ref_sp], dim=1)
 
                 try:
-                    ppgs, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
-                    s2s_attn = s2s_attn.transpose(-1, -2)
-                    s2s_attn = s2s_attn[..., 1:]
-                    s2s_attn = s2s_attn.transpose(-1, -2)
+                    with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                        ppgs, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
+                        s2s_attn = s2s_attn.transpose(-1, -2)
+                        s2s_attn = s2s_attn[..., 1:]
+                        s2s_attn = s2s_attn.transpose(-1, -2)
                 except RuntimeError:
                     raise
                 except Exception:
                     continue
 
-                mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
-                s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
+                with torch.cuda.amp.autocast(enabled=False):
+                    mask_ST = mask_from_lens(s2s_attn.float(), input_lengths, mel_input_length // (2 ** n_down))
+                    s2s_attn_mono = maximum_path(s2s_attn.float(), mask_ST)
 
-                # encode
-                t_en = model.text_encoder(texts, input_lengths, text_mask)
+                with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                    # encode
+                    t_en = model.text_encoder(texts, input_lengths, text_mask)
 
-                # 50% of chance of using monotonic version
-                if bool(random.getrandbits(1)):
-                    asr = (t_en @ s2s_attn)
-                else:
-                    asr = (t_en @ s2s_attn_mono)
+                    # 50% of chance of using monotonic version
+                    if bool(random.getrandbits(1)):
+                        asr = (t_en @ s2s_attn)
+                    else:
+                        asr = (t_en @ s2s_attn_mono)
 
-                d_gt = s2s_attn_mono.sum(axis=-1).detach()
+                    d_gt = s2s_attn_mono.sum(axis=-1).detach()
 
-                # compute the style of the entire utterance
-                # this operation cannot be done in batch because of the avgpool layer (may need to work on masked avgpool)
-                ss = []
-                gs = []
-                for bib in range(len(mel_input_length)):
-                    mel_length = int(mel_input_length[bib].item())
-                    mel = mels[bib, :, :mel_input_length[bib]]
-                    s = model.predictor_encoder(mel.unsqueeze(0).unsqueeze(1))
-                    ss.append(s)
-                    s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
-                    gs.append(s)
+                    # compute the style of the entire utterance
+                    # this operation cannot be done in batch because of the avgpool layer (may need to work on masked avgpool)
+                    ss = []
+                    gs = []
+                    for bib in range(len(mel_input_length)):
+                        mel_length = int(mel_input_length[bib].item())
+                        mel = mels[bib, :, :mel_input_length[bib]]
+                        s = model.predictor_encoder(mel.unsqueeze(0).unsqueeze(1))
+                        ss.append(s)
+                        s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
+                        gs.append(s)
 
-                s_dur = torch.stack(ss).squeeze()  # global prosodic styles
-                gs = torch.stack(gs).squeeze() # global acoustic styles
-                s_trg = torch.cat([gs, s_dur], dim=-1).detach() # ground truth for denoiser
+                    s_dur = torch.stack(ss).squeeze()  # global prosodic styles
+                    gs = torch.stack(gs).squeeze() # global acoustic styles
+                    s_trg = torch.cat([gs, s_dur], dim=-1).detach() # ground truth for denoiser
 
-                bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
-                d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
+                    bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
+                    d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
 
                 # denoiser training
                 if epoch >= diff_epoch:
-                    num_steps = np.random.randint(3, 5)
+                    num_steps = np.random.randint(diff_num_steps_min, diff_num_steps_max)
 
                     if model_params.diffusion.dist.estimate_sigma_data:
                         model.diffusion.module.diffusion.sigma_data = s_trg.std(axis=-1).mean().item() # batch-wise std estimation
                         running_std.append(model.diffusion.module.diffusion.sigma_data)
 
-                    if multispeaker:
-                        s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device),
-                              embedding=bert_dur,
-                              embedding_scale=1,
-                                       features=ref, # reference from the same speaker as the embedding
-                                 embedding_mask_proba=0.1,
-                                 num_steps=num_steps).squeeze(1)
-                        loss_diff = model.diffusion(s_trg.unsqueeze(1), embedding=bert_dur, features=ref).mean() # EDM loss
-                        loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
-                    else:
-                        s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device),
-                              embedding=bert_dur,
-                              embedding_scale=1,
-                                 embedding_mask_proba=0.1,
-                                 num_steps=num_steps).squeeze(1)
-                        loss_diff = model.diffusion.module.diffusion(s_trg.unsqueeze(1), embedding=bert_dur).mean() # EDM loss
-                        loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
+                    with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                        if multispeaker:
+                            s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device),
+                                  embedding=bert_dur,
+                                  embedding_scale=1,
+                                           features=ref, # reference from the same speaker as the embedding
+                                     embedding_mask_proba=0.1,
+                                     num_steps=num_steps).squeeze(1)
+                            loss_diff = model.diffusion(s_trg.unsqueeze(1), embedding=bert_dur, features=ref).mean() # EDM loss
+                            loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
+                        else:
+                            s_preds = sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(device),
+                                  embedding=bert_dur,
+                                  embedding_scale=1,
+                                     embedding_mask_proba=0.1,
+                                     num_steps=num_steps).squeeze(1)
+                            loss_diff = model.diffusion.module.diffusion(s_trg.unsqueeze(1), embedding=bert_dur).mean() # EDM loss
+                            loss_sty = F.l1_loss(s_preds, s_trg.detach()) # style reconstruction loss
                 else:
                     loss_sty = 0
                     loss_diff = 0
@@ -362,10 +394,11 @@ def main(config_path):
                 s_loss = 0
 
 
-                d, p = model.predictor(d_en, s_dur,
-                                                        input_lengths,
-                                                        s2s_attn_mono,
-                                                        text_mask)
+                with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                    d, p = model.predictor(d_en, s_dur,
+                                                            input_lengths,
+                                                            s2s_attn_mono,
+                                                            text_mask)
 
                 # With dynamic batching all mel_input_length values are equal, so
                 # mel_len == mel_input_length[0]/2 - 1 and random_start is always 0,
@@ -404,10 +437,11 @@ def main(config_path):
                 if gt.size(-1) < 80:
                     continue
 
-                s = model.style_encoder(gt.unsqueeze(1))
-                s_dur = model.predictor_encoder(gt.unsqueeze(1))
+                with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                    s = model.style_encoder(gt.unsqueeze(1))
+                    s_dur = model.predictor_encoder(gt.unsqueeze(1))
 
-                with torch.no_grad():
+                with torch.no_grad(), torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
                     F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1))
                     F0 = F0.reshape(F0.shape[0], F0.shape[1] * 2, F0.shape[2], 1).squeeze()
 
@@ -418,18 +452,22 @@ def main(config_path):
 
                     wav = y_rec_gt
 
-                F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s_dur)
+                with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                    F0_fake, N_fake = model.predictor.F0Ntrain(p_en, s_dur)
+                    y_rec = model.decoder(en, F0_fake, N_fake, s)
 
-                y_rec = model.decoder(en, F0_fake, N_fake, s)
+                loss_F0_rec =  (F.smooth_l1_loss(F0_real.float(), F0_fake.float())) / 10
+                loss_norm_rec = F.smooth_l1_loss(N_real.float(), N_fake.float())
 
-                loss_F0_rec =  (F.smooth_l1_loss(F0_real, F0_fake)) / 10
-                loss_norm_rec = F.smooth_l1_loss(N_real, N_fake)
-
-                optimizer.zero_grad()
-                d_loss = dl(wav.detach(), y_rec.detach()).mean()
-                d_loss.backward()
-                optimizer.step('msd')
-                optimizer.step('mpd')
+                do_disc_step = (iters % disc_update_freq) == 0
+                if do_disc_step:
+                    optimizer.zero_grad()
+                    d_loss = dl(wav.detach(), y_rec.detach()).mean()
+                    d_loss.backward()
+                    optimizer.step('msd')
+                    optimizer.step('mpd')
+                else:
+                    d_loss = 0
 
                 # generator loss
                 optimizer.zero_grad()
@@ -438,7 +476,9 @@ def main(config_path):
                 loss_gen_all = gl(wav, y_rec).mean()
                 # squeeze(1) only the channel dim; bare squeeze() collapses the
                 # batch dim when batch_size == 1 and breaks WavLM's conv1d.
-                loss_lm = wl(wav.detach().squeeze(1), y_rec.squeeze(1)).mean()
+                # WavLM is frozen+eval, so we keep it in fp32 even under AMP.
+                with torch.cuda.amp.autocast(enabled=False):
+                    loss_lm = wl(wav.detach().float().squeeze(1), y_rec.float().squeeze(1)).mean()
 
                 loss_ce = 0
                 loss_dur = 0
@@ -558,10 +598,11 @@ def main(config_path):
                         optimizer.step('predictor')
                         optimizer.step('diffusion')
 
-                        # SLM discriminator loss
+                        # SLM discriminator loss. retain_graph was unnecessary —
+                        # nothing else uses this graph after the backward pass.
                         if d_loss_slm != 0:
                             optimizer.zero_grad()
-                            d_loss_slm.backward(retain_graph=True)
+                            d_loss_slm.backward()
                             optimizer.step('wd')
 
                 # Advance the OneCycleLR schedule once per training iteration so

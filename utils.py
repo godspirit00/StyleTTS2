@@ -71,4 +71,79 @@ def recursive_munch(d):
 def log_print(message, logger):
     logger.info(message)
     print(message)
-    
+
+
+# ---------------------------------------------------------------------------
+# Training helpers: mixed precision + gradient checkpointing
+# ---------------------------------------------------------------------------
+
+def resolve_amp_dtype(spec):
+    """Map a config 'mixed_precision' value to (autocast_enabled, dtype, use_scaler).
+
+    Accepted spec values:
+        - "no" / False / None / ""   -> AMP disabled
+        - "fp16" / "float16"         -> autocast(fp16) + GradScaler
+        - "bf16" / "bfloat16"        -> autocast(bf16), no scaler (cuda 8.0+)
+    """
+    if spec is None or spec is False:
+        return False, torch.float32, False
+    if isinstance(spec, str):
+        s = spec.strip().lower()
+        if s in ("no", "none", "off", "false", ""):
+            return False, torch.float32, False
+        if s in ("fp16", "float16", "half"):
+            return True, torch.float16, True
+        if s in ("bf16", "bfloat16"):
+            return True, torch.bfloat16, False
+    raise ValueError(f"Unrecognized mixed_precision value: {spec!r}")
+
+
+class _NoOpScaler:
+    """GradScaler stub used when AMP is disabled or running in bf16.
+
+    Provides the same call surface (scale/step/update/unscale_) as
+    torch.cuda.amp.GradScaler so the training loop can be written once.
+    """
+    def scale(self, loss):
+        return loss
+    def step(self, optimizer):
+        if optimizer is not None:
+            optimizer.step()
+    def update(self):
+        pass
+    def unscale_(self, optimizer):
+        pass
+    def state_dict(self):
+        return {}
+    def load_state_dict(self, state_dict):
+        pass
+    def is_enabled(self):
+        return False
+
+
+def make_grad_scaler(use_scaler: bool, enabled: bool):
+    """Return a real ``torch.cuda.amp.GradScaler`` for fp16 AMP, else a stub."""
+    if use_scaler and enabled:
+        return torch.cuda.amp.GradScaler(enabled=True)
+    return _NoOpScaler()
+
+
+def enable_diffusion_gradient_checkpointing(enabled: bool) -> None:
+    """Toggle gradient checkpointing inside the diffusion transformer blocks.
+
+    Cuts activation memory at the cost of one extra forward pass per block
+    during backward.  Safe to call before training starts.
+    """
+    try:
+        from Modules.diffusion.modules import set_gradient_checkpointing
+        set_gradient_checkpointing(enabled)
+    except Exception:
+        pass
+
+
+def freeze_module(module):
+    """Disable gradient tracking and switch to eval-mode for ``module``."""
+    for p in module.parameters():
+        p.requires_grad = False
+    module.eval()
+    return module

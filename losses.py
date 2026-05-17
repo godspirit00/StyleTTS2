@@ -43,15 +43,20 @@ class STFTLoss(torch.nn.Module):
             Tensor: Spectral convergence loss value.
             Tensor: Log STFT magnitude loss value.
         """
-        x_mag = self.to_mel(x)
-        mean, std = -4, 4
-        x_mag = (torch.log(1e-5 + x_mag) - mean) / std
-        
-        y_mag = self.to_mel(y)
-        mean, std = -4, 4
-        y_mag = (torch.log(1e-5 + y_mag) - mean) / std
-        
-        sc_loss = self.spectral_convergenge_loss(x_mag, y_mag)    
+        # cuFFT does not support half precision on all GPUs and is numerically
+        # touchy at fp16 in general; force fp32 here so AMP training still works.
+        with torch.cuda.amp.autocast(enabled=False):
+            x = x.float()
+            y = y.float()
+            x_mag = self.to_mel(x)
+            mean, std = -4, 4
+            x_mag = (torch.log(1e-5 + x_mag) - mean) / std
+
+            y_mag = self.to_mel(y)
+            mean, std = -4, 4
+            y_mag = (torch.log(1e-5 + y_mag) - mean) / std
+
+            sc_loss = self.spectral_convergenge_loss(x_mag, y_mag)
         return sc_loss
 
 
@@ -195,8 +200,21 @@ class WavLMLoss(torch.nn.Module):
     def __init__(self, model, wd, model_sr, slm_sr=16000):
         super(WavLMLoss, self).__init__()
         self.wavlm = AutoModel.from_pretrained(model)
+        # WavLM is always frozen and used in eval-mode for feature extraction:
+        # disable gradient tracking and switch to eval here so the parent
+        # ``model.train()`` cannot accidentally turn its dropout/BN back on
+        # and so AdamW never allocates optimizer state for it.
+        self.wavlm.eval()
+        for p in self.wavlm.parameters():
+            p.requires_grad = False
         self.wd = wd
         self.resample = torchaudio.transforms.Resample(model_sr, slm_sr)
+
+    def train(self, mode: bool = True):
+        # Keep WavLM in eval() regardless of outer .train() calls.
+        super().train(mode)
+        self.wavlm.eval()
+        return self
      
     def forward(self, wav, y_rec):
         with torch.no_grad():

@@ -494,7 +494,9 @@ def build_dataloader(path_list,
                      collate_config={},
                      dataset_config={},
                      dynamic_batch=False,
-                     batch_size_file='batch_sizes.json'):
+                     batch_size_file='batch_sizes.json',
+                     prefetch_factor=2,
+                     persistent_workers=True):
     """Build a DataLoader for StyleTTS2 training or validation.
 
     When *dynamic_batch* is True the dataset pre-scans audio lengths, groups
@@ -518,6 +520,12 @@ def build_dataloader(path_list,
     )
     collate_fn = Collater(**collate_config)
 
+    # prefetch_factor/persistent_workers only apply when workers are spawned.
+    extra_kwargs = {}
+    if num_workers > 0:
+        extra_kwargs['prefetch_factor'] = prefetch_factor
+        extra_kwargs['persistent_workers'] = persistent_workers
+
     if dynamic_batch and not validation:
         batch_manager = BatchManager(batch_size_file, default_batch_size=batch_size)
         sampler = DynamicBatchSampler(dataset, batch_manager, shuffle=True)
@@ -527,6 +535,7 @@ def build_dataloader(path_list,
             num_workers=num_workers,
             collate_fn=collate_fn,
             pin_memory=(device != 'cpu'),
+            **extra_kwargs,
         )
         # Attach batch_manager so training scripts can access it for OOM handling
         data_loader.batch_manager = batch_manager
@@ -539,6 +548,7 @@ def build_dataloader(path_list,
             drop_last=(not validation),
             collate_fn=collate_fn,
             pin_memory=(device != 'cpu'),
+            **extra_kwargs,
         )
         data_loader.batch_manager = None
 

@@ -21,6 +21,17 @@ pretrained_model: "Models/LibriTTS/epochs_2nd_00020.pth"
 second_stage_load_pretrained: true # set to true if the pre-trained model is for 2nd stage
 load_only_params: true # set to true if do not want to load epoch numbers and optimizer parameters
 
+# ---------------------------------------------------------------------------
+# VRAM / speed knobs (see Configs/config.yml for full documentation).
+# ---------------------------------------------------------------------------
+mixed_precision: 'no'         # 'no' | 'bf16' | 'fp16'
+gradient_checkpointing: false # checkpointing inside diffusion transformer
+use_8bit_optimizer: false     # bitsandbytes AdamW8bit (~4x smaller state)
+disc_update_freq: 1           # update mpd/msd every N steps
+diffusion_num_steps_min: 3    # sampler steps per training iter (randint min)
+diffusion_num_steps_max: 5    # sampler steps per training iter (randint max)
+num_workers: 2                # DataLoader worker processes
+
 F0_path: "Utils/JDC/bst.t7"
 ASR_config: "Utils/ASR/config.yml"
 ASR_path: "Utils/ASR/epoch_00080.pth"

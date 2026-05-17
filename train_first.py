@@ -26,6 +26,7 @@ from meldataset import build_dataloader, get_bin_from_mel_input_length
 from utils import *
 from losses import *
 from optimizers import build_optimizer
+from utils import enable_diffusion_gradient_checkpointing
 import time
 
 from accelerate import Accelerator
@@ -47,7 +48,16 @@ def main(config_path):
     if not osp.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator = Accelerator(project_dir=log_dir, split_batches=True, kwargs_handlers=[ddp_kwargs])    
+    # Accelerate handles AMP itself; "no" / "fp16" / "bf16" all valid.
+    mixed_precision = config.get('mixed_precision', 'no')
+    if isinstance(mixed_precision, bool):
+        mixed_precision = 'no' if not mixed_precision else 'fp16'
+    accelerator = Accelerator(
+        project_dir=log_dir,
+        split_batches=True,
+        mixed_precision=mixed_precision,
+        kwargs_handlers=[ddp_kwargs],
+    )
     if accelerator.is_main_process:
         writer = SummaryWriter(log_dir + "/tensorboard")
 
@@ -77,6 +87,13 @@ def main(config_path):
     dynamic_batch = config.get('dynamic_batch', False)
     batch_size_file = osp.join(log_dir, 'batch_sizes.json')
 
+    # Optional speed/memory knobs (defaults preserve old behaviour).
+    num_workers = int(config.get('num_workers', 2))
+    grad_checkpoint = config.get('gradient_checkpointing', False)
+    use_8bit_optim = config.get('use_8bit_optimizer', False)
+    disc_update_freq = max(1, int(config.get('disc_update_freq', 1)))
+    enable_diffusion_gradient_checkpointing(grad_checkpoint)
+
     # load data
     train_list, val_list = get_data_path_list(train_path, val_path)
 
@@ -85,7 +102,7 @@ def main(config_path):
                                         OOD_data=OOD_data,
                                         min_length=min_length,
                                         batch_size=batch_size,
-                                        num_workers=2,
+                                        num_workers=num_workers,
                                         dataset_config={},
                                         device=device,
                                         dynamic_batch=dynamic_batch,
@@ -155,7 +172,8 @@ def main(config_path):
     # initialize optimizers after preparing models for compatibility with FSDP
     optimizer = build_optimizer({key: model[key].parameters() for key in model},
                                   scheduler_params_dict= {key: scheduler_params.copy() for key in model},
-                               lr=float(config['optimizer_params'].get('lr', 1e-4)))
+                               lr=float(config['optimizer_params'].get('lr', 1e-4)),
+                               use_8bit=use_8bit_optim)
     
     for k, v in optimizer.optimizers.items():
         optimizer.optimizers[k] = accelerator.prepare(optimizer.optimizers[k])
@@ -279,7 +297,8 @@ def main(config_path):
 
                 # discriminator loss
 
-                if epoch >= TMA_epoch:
+                do_disc_step = (epoch >= TMA_epoch) and ((iters % disc_update_freq) == 0)
+                if do_disc_step:
                     optimizer.zero_grad()
                     d_loss = dl(wav.detach().unsqueeze(1).float(), y_rec.detach()).mean()
                     accelerator.backward(d_loss)

@@ -8,6 +8,40 @@ from torch.optim import Optimizer
 from functools import reduce
 from torch.optim import AdamW
 
+
+# Lazy import for bitsandbytes 8-bit AdamW so the dependency stays optional.
+def _try_get_adamw8bit():
+    try:
+        import bitsandbytes as bnb  # type: ignore
+        return bnb.optim.AdamW8bit
+    except Exception:
+        return None
+
+
+def _build_adamw(params, lr, *, use_8bit=False, fused=True, eps=1e-9,
+                 weight_decay=1e-4, betas=(0.0, 0.99)):
+    """Build an AdamW optimizer.  Falls back gracefully when 8-bit is requested
+    but bitsandbytes is unavailable, or when fused kernels are unsupported.
+    """
+    params = list(params)
+    if use_8bit:
+        AdamW8bit = _try_get_adamw8bit()
+        if AdamW8bit is not None:
+            return AdamW8bit(params, lr=lr, weight_decay=weight_decay,
+                             betas=betas, eps=eps)
+        # bnb unavailable: fall through to fused/regular AdamW.
+
+    if fused and torch.cuda.is_available():
+        try:
+            return AdamW(params, lr=lr, weight_decay=weight_decay,
+                         betas=betas, eps=eps, fused=True)
+        except (TypeError, RuntimeError):
+            # Older PyTorch / unsupported device: fall back to non-fused.
+            pass
+    return AdamW(params, lr=lr, weight_decay=weight_decay,
+                 betas=betas, eps=eps)
+
+
 class MultiOptimizer:
     def __init__(self, optimizers={}, schedulers={}):
         self.optimizers = optimizers
@@ -62,12 +96,68 @@ def define_scheduler(optimizer, params):
 
     return scheduler
 
-def build_optimizer(parameters_dict, scheduler_params_dict, lr):
-    optim = dict([(key, AdamW(params, lr=lr, weight_decay=1e-4, betas=(0.0, 0.99), eps=1e-9))
-                   for key, params in parameters_dict.items()])
+def build_optimizer(parameters_dict, scheduler_params_dict, lr,
+                    use_8bit=False, fused=True):
+    """Build the per-module AdamW optimizers used by StyleTTS2.
 
-    schedulers = dict([(key, define_scheduler(opt, scheduler_params_dict[key])) \
-                       for key, opt in optim.items()])
+    Modules whose parameters are all frozen (``requires_grad=False``) get a
+    no-op optimizer instead of one allocating Adam state for unused params.
 
-    multi_optim = MultiOptimizer(optim, schedulers)
-    return multi_optim
+    Args:
+        use_8bit: if True, use bitsandbytes.optim.AdamW8bit when available
+            (~4x smaller optimizer state).  Falls back to standard AdamW.
+        fused:   if True, use the fused-AdamW CUDA kernel when available
+            (a small speedup).  Falls back to non-fused on older PyTorch.
+    """
+    optim = {}
+    for key, params in parameters_dict.items():
+        params = [p for p in params if p.requires_grad]
+        if len(params) == 0:
+            # Frozen module: provide a no-op optimizer so step()/zero_grad()
+            # still work without allocating Adam state for unused tensors.
+            optim[key] = _NoOpOptimizer()
+        else:
+            optim[key] = _build_adamw(
+                params, lr=lr, use_8bit=use_8bit, fused=fused,
+                weight_decay=1e-4, betas=(0.0, 0.99), eps=1e-9,
+            )
+
+    schedulers = {}
+    for key, opt in optim.items():
+        if isinstance(opt, _NoOpOptimizer):
+            schedulers[key] = _NoOpScheduler()
+        else:
+            schedulers[key] = define_scheduler(opt, scheduler_params_dict[key])
+
+    return MultiOptimizer(optim, schedulers)
+
+
+class _NoOpOptimizer:
+    """Stub that satisfies the MultiOptimizer API for fully-frozen modules."""
+
+    def __init__(self):
+        self.param_groups = []
+        self.state = {}
+
+    def step(self, *args, **kwargs):
+        pass
+
+    def zero_grad(self, *args, **kwargs):
+        pass
+
+    def state_dict(self):
+        return {}
+
+    def load_state_dict(self, state_dict):
+        pass
+
+
+class _NoOpScheduler:
+    def step(self, *args, **kwargs):
+        pass
+
+    def state_dict(self):
+        return {}
+
+    def load_state_dict(self, state_dict):
+        pass
