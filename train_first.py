@@ -142,6 +142,10 @@ def main(config_path):
     for k in model:
         model[k] = accelerator.prepare(model[k])
     
+    # Save batch_manager before accelerator.prepare() wraps the DataLoader,
+    # since the wrapper may not forward custom attributes.
+    batch_manager = train_dataloader.batch_manager
+
     train_dataloader, val_dataloader = accelerator.prepare(
         train_dataloader, val_dataloader
     )
@@ -188,6 +192,9 @@ def main(config_path):
 
         if epoch == TMA_epoch:
             log_print('Epoch %d: text aligner and pitch extractor joining training — VRAM usage will increase' % epoch, logger)
+            if dynamic_batch and batch_manager is not None:
+                batch_manager.scale_all(0.5)
+                log_print('Epoch %d: batch sizes halved proactively for TMA transition' % epoch, logger)
 
         for i, batch in enumerate(train_dataloader):
             try:
