@@ -436,7 +436,9 @@ def main(config_path):
 
                 loss_mel = stft_loss(y_rec, wav)
                 loss_gen_all = gl(wav, y_rec).mean()
-                loss_lm = wl(wav.detach().squeeze(), y_rec.squeeze()).mean()
+                # squeeze(1) only the channel dim; bare squeeze() collapses the
+                # batch dim when batch_size == 1 and breaks WavLM's conv1d.
+                loss_lm = wl(wav.detach().squeeze(1), y_rec.squeeze(1)).mean()
 
                 loss_ce = 0
                 loss_dur = 0
@@ -702,7 +704,9 @@ def main(config_path):
                     s = model.style_encoder(gt.unsqueeze(1))
 
                     y_rec = model.decoder(en, F0_fake, N_fake, s)
-                    loss_mel = stft_loss(y_rec.squeeze(), wav.detach())
+                    # squeeze(1) only the channel dim; bare squeeze() collapses
+                    # the batch dim too when batch_size == 1 and crashes cuFFT.
+                    loss_mel = stft_loss(y_rec.squeeze(1), wav.detach())
 
                     F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1)) 
 
