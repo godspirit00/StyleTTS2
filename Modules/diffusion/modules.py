@@ -5,10 +5,35 @@ from .utils import *
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as cp
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 from einops_exts import rearrange_many
 from torch import Tensor, einsum
+
+
+# Module-level flag toggled by training scripts that want gradient
+# checkpointing on the transformer blocks (cuts activation memory).
+_USE_GRADIENT_CHECKPOINTING = False
+
+
+def set_gradient_checkpointing(enabled: bool) -> None:
+    """Enable/disable gradient checkpointing in the diffusion transformers."""
+    global _USE_GRADIENT_CHECKPOINTING
+    _USE_GRADIENT_CHECKPOINTING = bool(enabled)
+
+
+def _maybe_checkpoint(module, *args, **kwargs):
+    """Run ``module(*args, **kwargs)`` under gradient checkpointing if it is
+    enabled and the inputs require grad, otherwise plain call.
+    """
+    if _USE_GRADIENT_CHECKPOINTING and torch.is_grad_enabled():
+        # use_reentrant=False matches modern PyTorch recommendation.
+        try:
+            return cp.checkpoint(module, *args, use_reentrant=False, **kwargs)
+        except TypeError:
+            return cp.checkpoint(module, *args, **kwargs)
+    return module(*args, **kwargs)
 
 
 """
@@ -142,28 +167,28 @@ class StyleTransformer1d(nn.Module):
         return mapping
             
     def run(self, x, time, embedding, features):
-        
+
         mapping = self.get_mapping(time, features)
         x = torch.cat([x.expand(-1, embedding.size(1), -1), embedding], axis=-1)
         mapping = mapping.unsqueeze(1).expand(-1, embedding.size(1), -1)
-        
+
         for block in self.blocks:
             x = x + mapping
-            x = block(x, features)
-        
+            x = _maybe_checkpoint(block, x, features)
+
         x = x.mean(axis=1).unsqueeze(1)
         x = self.to_out(x)
         x = x.transpose(-1, -2)
-        
+
         return x
-        
-    def forward(self, x: Tensor, 
-                time: Tensor, 
+
+    def forward(self, x: Tensor,
+                time: Tensor,
                 embedding_mask_proba: float = 0.0,
-                embedding: Optional[Tensor] = None, 
+                embedding: Optional[Tensor] = None,
                 features: Optional[Tensor] = None,
                embedding_scale: float = 1.0) -> Tensor:
-        
+
         b, device = embedding.shape[0], embedding.device
         fixed_embedding = self.fixed_embedding(embedding)
         if embedding_mask_proba > 0.0:
@@ -181,7 +206,7 @@ class StyleTransformer1d(nn.Module):
             return out_masked + (out - out_masked) * embedding_scale
         else:
             return self.run(x, time, embedding=embedding, features=features)
-        
+
         return x
 
 
@@ -388,24 +413,24 @@ class Transformer1d(nn.Module):
         mapping = self.get_mapping(time, features)
         x = torch.cat([x.expand(-1, embedding.size(1), -1), embedding], axis=-1)
         mapping = mapping.unsqueeze(1).expand(-1, embedding.size(1), -1)
-        
+
         for block in self.blocks:
             x = x + mapping
-            x = block(x)
-        
+            x = _maybe_checkpoint(block, x)
+
         x = x.mean(axis=1).unsqueeze(1)
         x = self.to_out(x)
         x = x.transpose(-1, -2)
-        
+
         return x
-        
-    def forward(self, x: Tensor, 
-                time: Tensor, 
+
+    def forward(self, x: Tensor,
+                time: Tensor,
                 embedding_mask_proba: float = 0.0,
-                embedding: Optional[Tensor] = None, 
+                embedding: Optional[Tensor] = None,
                 features: Optional[Tensor] = None,
                embedding_scale: float = 1.0) -> Tensor:
-        
+
         b, device = embedding.shape[0], embedding.device
         fixed_embedding = self.fixed_embedding(embedding)
         if embedding_mask_proba > 0.0:
@@ -423,7 +448,7 @@ class Transformer1d(nn.Module):
             return out_masked + (out - out_masked) * embedding_scale
         else:
             return self.run(x, time, embedding=embedding, features=features)
-        
+
         return x
 
 

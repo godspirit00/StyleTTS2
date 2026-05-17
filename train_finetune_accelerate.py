@@ -29,6 +29,7 @@ from Modules.slmadv import SLMAdversarialLoss
 from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSchedule
 
 from optimizers import build_optimizer
+from utils import enable_diffusion_gradient_checkpointing
 
 from accelerate import Accelerator
 
@@ -86,6 +87,17 @@ def main(config_path):
     max_len = config.get('max_len', 200)
     dynamic_batch = config.get('dynamic_batch', False)
 
+    # Optional speed/memory knobs.
+    num_workers = int(config.get('num_workers', 2))
+    grad_checkpoint = config.get('gradient_checkpointing', False)
+    use_8bit_optim = config.get('use_8bit_optimizer', False)
+    disc_update_freq = max(1, int(config.get('disc_update_freq', 1)))
+    diff_num_steps_min = int(config.get('diffusion_num_steps_min', 3))
+    diff_num_steps_max = int(config.get('diffusion_num_steps_max', 5))
+    if diff_num_steps_max <= diff_num_steps_min:
+        diff_num_steps_max = diff_num_steps_min + 1
+    enable_diffusion_gradient_checkpointing(grad_checkpoint)
+
     loss_params = Munch(config['loss_params'])
     diff_epoch = loss_params.diff_epoch
     joint_epoch = loss_params.joint_epoch
@@ -101,7 +113,7 @@ def main(config_path):
                                         OOD_data=OOD_data,
                                         min_length=min_length,
                                         batch_size=batch_size,
-                                        num_workers=2,
+                                        num_workers=num_workers,
                                         dataset_config={},
                                         device=device,
                                         dynamic_batch=dynamic_batch,
@@ -200,7 +212,8 @@ def main(config_path):
     scheduler_params_dict['style_encoder']['max_lr'] = optimizer_params.ft_lr * 2
     
     optimizer = build_optimizer({key: model[key].parameters() for key in model},
-                                          scheduler_params_dict=scheduler_params_dict, lr=optimizer_params.lr)
+                                          scheduler_params_dict=scheduler_params_dict, lr=optimizer_params.lr,
+                                          use_8bit=use_8bit_optim)
     
     # adjust BERT learning rate
     for g in optimizer.optimizers['bert'].param_groups:
@@ -347,7 +360,7 @@ def main(config_path):
 
                 # denoiser training
                 if epoch >= diff_epoch:
-                    num_steps = np.random.randint(3, 5)
+                    num_steps = np.random.randint(diff_num_steps_min, diff_num_steps_max)
 
                     if model_params.diffusion.dist.estimate_sigma_data:
                         model.diffusion.module.diffusion.sigma_data = s_trg.std(axis=-1).mean().item() # batch-wise std estimation
@@ -441,11 +454,15 @@ def main(config_path):
                 loss_F0_rec =  (F.smooth_l1_loss(F0_real, F0_fake)) / 10
                 loss_norm_rec = F.smooth_l1_loss(N_real, N_fake)
 
-                optimizer.zero_grad()
-                d_loss = dl(wav.detach(), y_rec.detach()).mean()
-                accelerator.backward(d_loss)
-                optimizer.step('msd')
-                optimizer.step('mpd')
+                do_disc_step = (iters % disc_update_freq) == 0
+                if do_disc_step:
+                    optimizer.zero_grad()
+                    d_loss = dl(wav.detach(), y_rec.detach()).mean()
+                    accelerator.backward(d_loss)
+                    optimizer.step('msd')
+                    optimizer.step('mpd')
+                else:
+                    d_loss = 0
 
                 # generator loss
                 optimizer.zero_grad()
