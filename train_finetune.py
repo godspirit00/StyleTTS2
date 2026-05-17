@@ -261,8 +261,14 @@ def main(config_path):
 
         if epoch == diff_epoch:
             logger.info('Epoch %d: diffusion training starting — VRAM usage will increase' % epoch)
+            if dynamic_batch and train_dataloader.batch_manager is not None:
+                train_dataloader.batch_manager.scale_all(0.5)
+                logger.info('Epoch %d: batch sizes halved proactively for diffusion transition' % epoch)
         if epoch == joint_epoch:
             logger.info('Epoch %d: joint training starting — VRAM usage will increase' % epoch)
+            if dynamic_batch and train_dataloader.batch_manager is not None:
+                train_dataloader.batch_manager.scale_all(0.5)
+                logger.info('Epoch %d: batch sizes halved proactively for joint training transition' % epoch)
 
         for i, batch in enumerate(train_dataloader):
             try:

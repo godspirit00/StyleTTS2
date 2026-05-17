@@ -259,8 +259,14 @@ def main(config_path):
 
         if epoch == diff_epoch:
             logger.info('Epoch %d: diffusion training starting — VRAM usage will increase' % epoch)
+            if dynamic_batch and train_dataloader.batch_manager is not None:
+                train_dataloader.batch_manager.scale_all(0.5)
+                logger.info('Epoch %d: batch sizes halved proactively for diffusion transition' % epoch)
         if epoch == joint_epoch:
             logger.info('Epoch %d: joint training starting — VRAM usage will increase' % epoch)
+            if dynamic_batch and train_dataloader.batch_manager is not None:
+                train_dataloader.batch_manager.scale_all(0.5)
+                logger.info('Epoch %d: batch sizes halved proactively for joint training transition' % epoch)
 
         if epoch >= diff_epoch:
             start_ds = True
@@ -721,7 +727,6 @@ def main(config_path):
                     en = asr[bib, :, :mel_length // 2].unsqueeze(0)
 
                     F0_real, _, _ = model.pitch_extractor(gt.unsqueeze(1))
-                    F0_real = F0_real.unsqueeze(0)
                     s = model.style_encoder(gt.unsqueeze(1))
                     real_norm = log_norm(gt.unsqueeze(1)).squeeze(1)
 

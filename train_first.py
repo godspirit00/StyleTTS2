@@ -137,6 +137,10 @@ def main(config_path):
     for k in model:
         model[k] = accelerator.prepare(model[k])
     
+    # Save batch_manager before accelerator.prepare() wraps the DataLoader,
+    # since the wrapper may not forward custom attributes.
+    batch_manager = train_dataloader.batch_manager
+
     train_dataloader, val_dataloader = accelerator.prepare(
         train_dataloader, val_dataloader
     )
@@ -183,6 +187,9 @@ def main(config_path):
 
         if epoch == TMA_epoch:
             log_print('Epoch %d: text aligner and pitch extractor joining training — VRAM usage will increase' % epoch, logger)
+            if dynamic_batch and batch_manager is not None:
+                batch_manager.scale_all(0.5)
+                log_print('Epoch %d: batch sizes halved proactively for TMA transition' % epoch, logger)
 
         for i, batch in enumerate(train_dataloader):
             try:
@@ -338,12 +345,12 @@ def main(config_path):
                     log_print('WARNING: OOM at step %d, skipping batch' % i, logger)
                     torch.cuda.empty_cache()
                     optimizer.zero_grad()
-                    if dynamic_batch and train_dataloader.batch_manager is not None:
+                    if dynamic_batch and batch_manager is not None:
                         try:
                             _bin = get_bin_from_mel_input_length(mel_input_length)
-                            if train_dataloader.batch_manager.decrement(_bin):
+                            if batch_manager.decrement(_bin):
                                 log_print('Reduced batch size for bin %d to %d' % (
-                                    _bin, train_dataloader.batch_manager.get(_bin)), logger)
+                                    _bin, batch_manager.get(_bin)), logger)
                         except (NameError, UnboundLocalError):
                             pass
                 else:

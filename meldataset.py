@@ -134,6 +134,21 @@ class BatchManager:
             return True
         return False
 
+    def scale_all(self, factor):
+        """Multiply every bin's batch size by *factor* (floor, minimum 1) and save.
+
+        Call this proactively at epoch boundaries where VRAM usage jumps
+        (e.g. when discriminators or the diffusion model join training) so that
+        the next epoch starts with sizes that fit in the new memory budget.
+        """
+        all_bins = set(self.batch_sizes.keys())
+        # Also cover bins that haven't been written yet (still at default)
+        for bin_id in all_bins:
+            new_size = max(1, int(self.get(bin_id) * factor))
+            self.batch_sizes[bin_id] = new_size
+        self._save()
+        logger.info('BatchManager: all bin batch sizes scaled by %.2f', factor)
+
     def _save(self):
         with open(self.json_path, 'w') as f:
             json.dump({str(k): v for k, v in self.batch_sizes.items()}, f, indent=2)

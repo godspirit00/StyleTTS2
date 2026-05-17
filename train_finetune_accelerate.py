@@ -247,6 +247,10 @@ def main(config_path):
                                 sig=slmadv_params.sig
                                )
 
+    # Save batch_manager before accelerator.prepare() wraps the DataLoader,
+    # since the wrapper may not forward custom attributes.
+    batch_manager = train_dataloader.batch_manager
+
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader
     )
@@ -268,8 +272,14 @@ def main(config_path):
 
         if epoch == diff_epoch:
             logger.info('Epoch %d: diffusion training starting — VRAM usage will increase' % epoch)
+            if dynamic_batch and batch_manager is not None:
+                batch_manager.scale_all(0.5)
+                logger.info('Epoch %d: batch sizes halved proactively for diffusion transition' % epoch)
         if epoch == joint_epoch:
             logger.info('Epoch %d: joint training starting — VRAM usage will increase' % epoch)
+            if dynamic_batch and batch_manager is not None:
+                batch_manager.scale_all(0.5)
+                logger.info('Epoch %d: batch sizes halved proactively for joint training transition' % epoch)
 
         for i, batch in enumerate(train_dataloader):
             try:
@@ -588,12 +598,12 @@ def main(config_path):
                     logger.warning('WARNING: OOM at step %d, skipping batch' % i)
                     torch.cuda.empty_cache()
                     optimizer.zero_grad()
-                    if dynamic_batch and train_dataloader.batch_manager is not None:
+                    if dynamic_batch and batch_manager is not None:
                         try:
                             _bin = get_bin_from_mel_input_length(mel_input_length)
-                            if train_dataloader.batch_manager.decrement(_bin):
+                            if batch_manager.decrement(_bin):
                                 logger.info('Reduced batch size for bin %d to %d' % (
-                                    _bin, train_dataloader.batch_manager.get(_bin)))
+                                    _bin, batch_manager.get(_bin)))
                         except (NameError, UnboundLocalError):
                             pass
                 else:
