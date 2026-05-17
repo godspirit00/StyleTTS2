@@ -97,7 +97,7 @@ def main(config_path):
     if diff_num_steps_max <= diff_num_steps_min:
         diff_num_steps_max = diff_num_steps_min + 1
 
-    amp_enabled, amp_dtype, use_scaler = resolve_amp_dtype(mixed_precision)
+    amp_enabled, amp_dtype = resolve_amp_dtype(mixed_precision)
     enable_diffusion_gradient_checkpointing(grad_checkpoint)
 
     loss_params = Munch(config['loss_params'])
@@ -224,9 +224,6 @@ def main(config_path):
     optimizer = build_optimizer({key: model[key].parameters() for key in model},
                                           scheduler_params_dict=scheduler_params_dict, lr=optimizer_params.lr,
                                           use_8bit=use_8bit_optim)
-    if amp_enabled and use_scaler:
-        logger.warning("mixed_precision='fp16' selected but GradScaler is not wired "
-                       "into the fine-tune multi-backward loop; bf16 is recommended.")
 
     # adjust BERT AdamW hyperparams (lr is managed by the scheduler via max_lr above)
     for g in optimizer.optimizers['bert'].param_groups:

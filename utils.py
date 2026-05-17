@@ -78,54 +78,34 @@ def log_print(message, logger):
 # ---------------------------------------------------------------------------
 
 def resolve_amp_dtype(spec):
-    """Map a config 'mixed_precision' value to (autocast_enabled, dtype, use_scaler).
+    """Map a config 'mixed_precision' value to (autocast_enabled, dtype).
 
     Accepted spec values:
         - "no" / False / None / ""   -> AMP disabled
-        - "fp16" / "float16"         -> autocast(fp16) + GradScaler
-        - "bf16" / "bfloat16"        -> autocast(bf16), no scaler (cuda 8.0+)
+        - "bf16" / "bfloat16"        -> autocast(bf16) (Ampere+ / cuda 8.0+)
+
+    fp16 is rejected because the manual-AMP scripts (train_second.py,
+    train_finetune.py) issue multiple ``backward()`` calls per iteration and
+    the GradScaler integration required to keep fp16 stable is not wired in.
+    Use ``bf16`` on Ampere+ GPUs, or use the Accelerate-based scripts
+    (train_first.py / train_finetune_accelerate.py) which scale internally.
     """
     if spec is None or spec is False:
-        return False, torch.float32, False
+        return False, torch.float32
     if isinstance(spec, str):
         s = spec.strip().lower()
         if s in ("no", "none", "off", "false", ""):
-            return False, torch.float32, False
-        if s in ("fp16", "float16", "half"):
-            return True, torch.float16, True
+            return False, torch.float32
         if s in ("bf16", "bfloat16"):
-            return True, torch.bfloat16, False
+            return True, torch.bfloat16
+        if s in ("fp16", "float16", "half"):
+            raise ValueError(
+                "mixed_precision='fp16' is not supported in the manual-AMP "
+                "training scripts because GradScaler is not wired into the "
+                "multi-backward loop and unscaled fp16 grads will overflow. "
+                "Use 'bf16' instead, or switch to the Accelerate-based "
+                "scripts (train_first.py / train_finetune_accelerate.py).")
     raise ValueError(f"Unrecognized mixed_precision value: {spec!r}")
-
-
-class _NoOpScaler:
-    """GradScaler stub used when AMP is disabled or running in bf16.
-
-    Provides the same call surface (scale/step/update/unscale_) as
-    torch.cuda.amp.GradScaler so the training loop can be written once.
-    """
-    def scale(self, loss):
-        return loss
-    def step(self, optimizer):
-        if optimizer is not None:
-            optimizer.step()
-    def update(self):
-        pass
-    def unscale_(self, optimizer):
-        pass
-    def state_dict(self):
-        return {}
-    def load_state_dict(self, state_dict):
-        pass
-    def is_enabled(self):
-        return False
-
-
-def make_grad_scaler(use_scaler: bool, enabled: bool):
-    """Return a real ``torch.cuda.amp.GradScaler`` for fp16 AMP, else a stub."""
-    if use_scaler and enabled:
-        return torch.cuda.amp.GradScaler(enabled=True)
-    return _NoOpScaler()
 
 
 def enable_diffusion_gradient_checkpointing(enabled: bool) -> None:
@@ -139,11 +119,3 @@ def enable_diffusion_gradient_checkpointing(enabled: bool) -> None:
         set_gradient_checkpointing(enabled)
     except Exception:
         pass
-
-
-def freeze_module(module):
-    """Disable gradient tracking and switch to eval-mode for ``module``."""
-    for p in module.parameters():
-        p.requires_grad = False
-    module.eval()
-    return module
