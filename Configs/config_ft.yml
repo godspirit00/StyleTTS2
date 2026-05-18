@@ -31,6 +31,8 @@ disc_update_freq: 1           # update mpd/msd every N steps
 diffusion_num_steps_min: 3    # sampler steps per training iter (randint min)
 diffusion_num_steps_max: 5    # sampler steps per training iter (randint max)
 num_workers: 2                # DataLoader worker processes
+cuda_expandable_segments: true  # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+                                # to reduce VRAM fragmentation with dynamic_batch
 
 F0_path: "Utils/JDC/bst.t7"
 ASR_config: "Utils/ASR/config.yml"

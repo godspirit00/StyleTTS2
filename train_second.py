@@ -28,6 +28,8 @@ from utils import *
 from utils import (
     resolve_amp_dtype,
     enable_diffusion_gradient_checkpointing,
+    configure_cuda_allocator,
+    cuda_memory_summary,
 )
 
 from Modules.slmadv import SLMAdversarialLoss
@@ -97,6 +99,11 @@ def main(config_path):
     diff_num_steps_max = int(config.get('diffusion_num_steps_max', 5))
     if diff_num_steps_max <= diff_num_steps_min:
         diff_num_steps_max = diff_num_steps_min + 1
+
+    # Mitigate CUDA fragmentation with dynamic_batch: must run before any
+    # tensor is moved to CUDA.  Disable via cuda_expandable_segments: false.
+    if config.get('cuda_expandable_segments', True):
+        configure_cuda_allocator(expandable_segments=True)
 
     amp_enabled, amp_dtype, use_scaler = resolve_amp_dtype(mixed_precision)
     enable_diffusion_gradient_checkpointing(grad_checkpoint)
@@ -308,6 +315,23 @@ def main(config_path):
             start_ds = True
 
         for i, batch in enumerate(train_dataloader):
+            # Pre-declare every iter-local so the OOM-cleanup `del` below
+            # always sees a bound name, regardless of where the OOM hit.
+            waves = texts = input_lengths = ref_texts = ref_lengths = None
+            mels = mel_input_length = ref_mels = None
+            mask = mel_mask = text_mask = None
+            ref_ss = ref_sp = ref = None
+            s2s_attn = mask_ST = s2s_attn_mono = None
+            t_en = asr = d_gt = None
+            ss = gs = s_dur = s_trg = bert_dur = d_en = None
+            s_preds = loss_diff = loss_sty = None
+            d = p = en = gt = p_en = wav = st = s = None
+            F0_real = F0 = N_real = asr_real = y_rec_gt = y_rec_gt_pred = None
+            F0_fake = N_fake = y_rec = None
+            loss_F0_rec = loss_norm_rec = d_loss = loss_mel = None
+            loss_gen_all = loss_lm = loss_ce = loss_dur = None
+            g_loss = None
+            slm_out = d_loss_slm = loss_gen_lm = y_pred = None
             try:
                 waves = batch[0]
                 batch = [b.to(device) for b in batch[1:]]
@@ -636,16 +660,41 @@ def main(config_path):
             except RuntimeError as e:
                 if 'out of memory' in str(e).lower():
                     logger.warning('WARNING: OOM at step %d, skipping batch' % i)
-                    torch.cuda.empty_cache()
+                    logger.info('Pre-cleanup ' + cuda_memory_summary())
+                    _bin_for_decrement = None
+                    try:
+                        _bin_for_decrement = get_bin_from_mel_input_length(mel_input_length)
+                    except (NameError, UnboundLocalError):
+                        pass
+                    # Drop every iter-local so the partial autograd graph
+                    # is released NOW (before the next iter allocates new
+                    # tensors). `del` requires names to be bound; the None
+                    # pre-init at the top of the iter body guarantees this.
+                    del waves, batch, texts, input_lengths, ref_texts
+                    del ref_lengths, mels, mel_input_length, ref_mels
+                    del mask, mel_mask, text_mask, ref_ss, ref_sp, ref
+                    del s2s_attn, mask_ST, s2s_attn_mono
+                    del t_en, asr, d_gt, ss, gs, s_dur, s_trg, bert_dur, d_en
+                    del s_preds, loss_diff, loss_sty
+                    del d, p, en, gt, p_en, wav, st, s
+                    del F0_real, F0, N_real, asr_real
+                    del y_rec_gt, y_rec_gt_pred, F0_fake, N_fake, y_rec
+                    del loss_F0_rec, loss_norm_rec, d_loss, loss_mel
+                    del loss_gen_all, loss_lm, loss_ce, loss_dur, g_loss
+                    del slm_out, d_loss_slm, loss_gen_lm, y_pred
                     optimizer.zero_grad()
-                    if dynamic_batch and train_dataloader.batch_manager is not None:
-                        try:
-                            _bin = get_bin_from_mel_input_length(mel_input_length)
-                            if train_dataloader.batch_manager.decrement(_bin):
-                                logger.info('Reduced batch size for bin %d to %d' % (
-                                    _bin, train_dataloader.batch_manager.get(_bin)))
-                        except (NameError, UnboundLocalError):
-                            pass
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception:
+                        pass
+                    logger.info('Post-cleanup ' + cuda_memory_summary())
+                    if dynamic_batch and train_dataloader.batch_manager is not None and _bin_for_decrement is not None:
+                        if train_dataloader.batch_manager.decrement(_bin_for_decrement):
+                            logger.info('Reduced batch size for bin %d to %d' % (
+                                _bin_for_decrement, train_dataloader.batch_manager.get(_bin_for_decrement)))
                 else:
                     raise
 

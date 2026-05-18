@@ -50,6 +50,12 @@ diffusion_num_steps_min: 3
 diffusion_num_steps_max: 5
 # num_workers: DataLoader worker processes (per-rank when using Accelerate).
 num_workers: 2
+# cuda_expandable_segments: set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#   (PyTorch 2.1+) to mitigate VRAM fragmentation that builds up with
+#   dynamic_batch over many iterations. Strongly recommended when using
+#   dynamic_batch with a long max_len. Has no effect if the env var is
+#   already set externally, or on older PyTorch versions.
+cuda_expandable_segments: true
 
 F0_path: "Utils/JDC/bst.t7"
 ASR_config: "Utils/ASR/config.yml"

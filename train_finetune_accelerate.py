@@ -29,7 +29,11 @@ from Modules.slmadv import SLMAdversarialLoss
 from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSchedule
 
 from optimizers import build_optimizer
-from utils import enable_diffusion_gradient_checkpointing
+from utils import enable_diffusion_gradient_checkpointing, configure_cuda_allocator
+
+# Configure CUDA allocator BEFORE Accelerator initialises a CUDA context.
+# Skip via env var PYTORCH_CUDA_ALLOC_CONF if already set.
+configure_cuda_allocator(expandable_segments=True)
 
 from accelerate import Accelerator
 
@@ -96,6 +100,8 @@ def main(config_path):
     diff_num_steps_max = int(config.get('diffusion_num_steps_max', 5))
     if diff_num_steps_max <= diff_num_steps_min:
         diff_num_steps_max = diff_num_steps_min + 1
+    if config.get('cuda_expandable_segments', True):
+        configure_cuda_allocator(expandable_segments=True)
     enable_diffusion_gradient_checkpointing(grad_checkpoint)
 
     loss_params = Munch(config['loss_params'])

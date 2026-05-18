@@ -26,7 +26,7 @@ from meldataset import build_dataloader, get_bin_from_mel_input_length
 from utils import *
 from losses import *
 from optimizers import build_optimizer
-from utils import enable_diffusion_gradient_checkpointing
+from utils import enable_diffusion_gradient_checkpointing, configure_cuda_allocator
 import time
 
 from accelerate import Accelerator
@@ -92,6 +92,8 @@ def main(config_path):
     grad_checkpoint = config.get('gradient_checkpointing', False)
     use_8bit_optim = config.get('use_8bit_optimizer', False)
     disc_update_freq = max(1, int(config.get('disc_update_freq', 1)))
+    if config.get('cuda_expandable_segments', True):
+        configure_cuda_allocator(expandable_segments=True)
     enable_diffusion_gradient_checkpointing(grad_checkpoint)
 
     # load data
