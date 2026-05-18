@@ -119,3 +119,91 @@ def enable_diffusion_gradient_checkpointing(enabled: bool) -> None:
         set_gradient_checkpointing(enabled)
     except Exception:
         pass
+
+
+def freeze_module(module):
+    """Disable gradient tracking and switch to eval-mode for ``module``."""
+    for p in module.parameters():
+        p.requires_grad = False
+    module.eval()
+    return module
+
+
+def configure_cuda_allocator(expandable_segments: bool = True,
+                             max_split_size_mb=None) -> None:
+    """Configure the PyTorch CUDA caching allocator.
+
+    Must run before any CUDA tensor is created (i.e. at the very top of
+    training, before ``.to('cuda')``).  Sets ``PYTORCH_CUDA_ALLOC_CONF``
+    if it has not already been set in the environment.
+
+    ``expandable_segments=True`` (PyTorch 2.1+) is the standard fix for
+    fragmentation in workloads with variable-shape allocations such as
+    StyleTTS2's dynamic batching.
+    """
+    import os
+    if 'PYTORCH_CUDA_ALLOC_CONF' in os.environ:
+        # Respect any user-supplied configuration.
+        return
+    parts = []
+    if expandable_segments:
+        parts.append('expandable_segments:True')
+    if max_split_size_mb is not None:
+        parts.append(f'max_split_size_mb:{int(max_split_size_mb)}')
+    if parts:
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = ','.join(parts)
+
+
+def cuda_memory_summary() -> str:
+    """Return a short string with current/peak CUDA memory usage (in GiB)."""
+    if not torch.cuda.is_available():
+        return 'CUDA unavailable'
+    gib = 1024 ** 3
+    return (
+        'cuda mem: '
+        f'allocated={torch.cuda.memory_allocated() / gib:.2f} GiB, '
+        f'reserved={torch.cuda.memory_reserved() / gib:.2f} GiB, '
+        f'peak_allocated={torch.cuda.max_memory_allocated() / gib:.2f} GiB, '
+        f'peak_reserved={torch.cuda.max_memory_reserved() / gib:.2f} GiB'
+    )
+
+
+def recover_from_oom(local_vars_to_drop, optimizer=None, logger=None) -> None:
+    """Free as much VRAM as possible after a CUDA OOM.
+
+    The default OOM handler just calls ``empty_cache``; the autograd graph
+    attached to the iteration's local tensors stays alive until the next
+    iteration overwrites them, which keeps a large chunk of VRAM tied up
+    and often triggers a second OOM.  This helper drops those references
+    explicitly, runs gc, and resets the allocator.
+
+    Args:
+        local_vars_to_drop: a list of names that the caller wants cleared.
+            Pass the calling frame's ``locals()`` if you want all locals
+            scrubbed.
+        optimizer: optional ``MultiOptimizer`` — its grads are zeroed so the
+            backward-graph references are released too.
+        logger: optional logger for diagnostic output.
+    """
+    import gc
+    if optimizer is not None:
+        try:
+            optimizer.zero_grad()
+        except Exception:
+            pass
+    # Drop references to the iteration's locals so their graphs are freed.
+    if isinstance(local_vars_to_drop, dict):
+        for k in list(local_vars_to_drop.keys()):
+            local_vars_to_drop[k] = None
+    elif isinstance(local_vars_to_drop, list):
+        for i in range(len(local_vars_to_drop)):
+            local_vars_to_drop[i] = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        if logger is not None:
+            try:
+                logger.info('Post-OOM ' + cuda_memory_summary())
+            except Exception:
+                pass
