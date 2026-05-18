@@ -14,7 +14,7 @@ load_only_params: false # set to true if do not want to load epoch numbers and o
 # ---------------------------------------------------------------------------
 # VRAM / speed knobs (see Configs/config.yml for full documentation).
 # ---------------------------------------------------------------------------
-mixed_precision: 'no'         # 'no' | 'bf16' | 'fp16'
+mixed_precision: 'no'         # 'no' | 'bf16' (fp16 only for Accelerate scripts)
 gradient_checkpointing: false # checkpointing inside diffusion transformer
 use_8bit_optimizer: false     # bitsandbytes AdamW8bit (~4x smaller state)
 disc_update_freq: 1           # update mpd/msd every N steps

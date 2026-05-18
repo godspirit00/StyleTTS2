@@ -239,9 +239,11 @@ def main(config_path):
 
                 s2s_attn.masked_fill_(attn_mask, 0.0)
 
-                with torch.no_grad():
-                    mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
-                    s2s_attn_mono = maximum_path(s2s_attn, mask_ST)
+                # maximum_path / mask_from_lens go through .numpy(); bf16 tensors
+                # cannot be converted, so disable autocast and cast to fp32.
+                with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
+                    mask_ST = mask_from_lens(s2s_attn.float(), input_lengths, mel_input_length // (2 ** n_down))
+                    s2s_attn_mono = maximum_path(s2s_attn.float(), mask_ST)
 
                 # encode
                 t_en = model.text_encoder(texts, input_lengths, text_mask)
@@ -325,7 +327,9 @@ def main(config_path):
                     loss_mono = F.l1_loss(s2s_attn, s2s_attn_mono) * 10
 
                     loss_gen_all = gl(wav.detach().unsqueeze(1).float(), y_rec).mean()
-                    loss_slm = wl(wav.detach(), y_rec).mean()
+                    # WavLM is frozen+eval; keep it in fp32 under AMP for stability.
+                    with torch.cuda.amp.autocast(enabled=False):
+                        loss_slm = wl(wav.detach().float(), y_rec.float()).mean()
 
                     g_loss = loss_params.lambda_mel * loss_mel + \
                     loss_params.lambda_mono * loss_mono + \

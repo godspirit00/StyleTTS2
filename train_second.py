@@ -230,13 +230,7 @@ def main(config_path):
     optimizer = build_optimizer({key: model[key].parameters() for key in model},
                                           scheduler_params_dict=scheduler_params_dict, lr=optimizer_params.lr,
                                           use_8bit=use_8bit_optim)
-    if amp_enabled and use_scaler:
-        # fp16 multi-backward+gradient-scaling integration is non-trivial here
-        # (the SLM-adv path manually inspects/scales grads), so we recommend bf16.
-        logger.warning("mixed_precision='fp16' selected but GradScaler is not wired "
-                       "into the stage-2 multi-backward loop; bf16 is recommended "
-                       "for stable training on Ampere+ GPUs.")
-    
+
     # adjust BERT learning rate
     for g in optimizer.optimizers['bert'].param_groups:
         g['betas'] = (0.9, 0.99)
