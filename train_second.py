@@ -105,7 +105,7 @@ def main(config_path):
     if config.get('cuda_expandable_segments', True):
         configure_cuda_allocator(expandable_segments=True)
 
-    amp_enabled, amp_dtype, use_scaler = resolve_amp_dtype(mixed_precision)
+    amp_enabled, amp_dtype = resolve_amp_dtype(mixed_precision)
     enable_diffusion_gradient_checkpointing(grad_checkpoint)
 
     loss_params = Munch(config['loss_params'])
