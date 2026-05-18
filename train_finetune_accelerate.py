@@ -109,8 +109,10 @@ def main(config_path):
     diff_num_steps_max = int(config.get('diffusion_num_steps_max', 5))
     if diff_num_steps_max <= diff_num_steps_min:
         diff_num_steps_max = diff_num_steps_min + 1
-    if config.get('cuda_expandable_segments', True):
-        configure_cuda_allocator(expandable_segments=True)
+    # NOTE: configure_cuda_allocator() must run before Accelerator() initialises
+    # a CUDA context, so it is called at module import time (see top of file).
+    # The 'cuda_expandable_segments' YAML flag is therefore not honored here;
+    # set PYTORCH_CUDA_ALLOC_CONF in the environment before launch to override.
     enable_diffusion_gradient_checkpointing(grad_checkpoint)
 
     loss_params = Munch(config['loss_params'])
