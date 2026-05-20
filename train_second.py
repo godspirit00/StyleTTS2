@@ -568,13 +568,17 @@ def main(config_path):
                         ref_lengths = input_lengths
                         ref_texts = texts
 
+                    # slmadv is not wrapped in autocast; its internal model
+                    # forwards run in fp32, so style inputs must be cast back
+                    # from bf16 to match the fp32 Linear weights.
                     slm_out = slmadv(i,
                                      y_rec_gt,
                                      y_rec_gt_pred,
                                      waves,
                                      mel_input_length,
                                      ref_texts,
-                                     ref_lengths, use_ind, s_trg.detach(), ref if multispeaker else None)
+                                     ref_lengths, use_ind, s_trg.detach().float(),
+                                     ref.float() if multispeaker else None)
 
                     if slm_out is None:
                         continue
