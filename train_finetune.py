@@ -512,8 +512,14 @@ def main(config_path):
                         _s2s_trg[p, :_text_input[p]] = 1
                     _dur_pred = torch.sigmoid(_s2s_pred).sum(axis=1)
 
-                    loss_dur += F.l1_loss(_dur_pred[1:_text_length-1],
-                                           _text_input[1:_text_length-1])
+                    # Include the trailing token in the L1 duration loss.
+                    # Excluding it ([:_text_length-1]) leaves the predicted duration
+                    # of the last phoneme unconstrained, which on small finetune
+                    # datasets drifts upward and (combined with the inference
+                    # pred_dur[-1]+=5 hack) produces trailing-syllable repetition
+                    # like "synthesis" -> "synthesisis".
+                    loss_dur += F.l1_loss(_dur_pred[1:_text_length],
+                                           _text_input[1:_text_length])
                     loss_ce += F.binary_cross_entropy_with_logits(_s2s_pred.flatten(), _s2s_trg.flatten())
 
                 loss_ce /= texts.size(0)
@@ -791,8 +797,8 @@ def main(config_path):
                         for bib in range(_s2s_trg.shape[0]):
                             _s2s_trg[bib, :_text_input[bib]] = 1
                         _dur_pred = torch.sigmoid(_s2s_pred).sum(axis=1)
-                        loss_dur += F.l1_loss(_dur_pred[1:_text_length-1], 
-                                               _text_input[1:_text_length-1])
+                        loss_dur += F.l1_loss(_dur_pred[1:_text_length],
+                                               _text_input[1:_text_length])
 
                     loss_dur /= texts.size(0)
 
