@@ -104,55 +104,107 @@ def get_bin_from_mel_input_length(mel_input_length):
 
 
 class BatchManager:
-    """Persists per-bin batch sizes in a JSON file.
+    """Decides the batch size for each length bin.
 
-    Allows automatic reduction on OOM and manual tuning between runs.
-    If the JSON does not exist, *default_batch_size* is used for every bin.
+    The per-bin size comes from three sources, in priority order:
+      1. an explicit entry in the JSON file (OOM-reduced or hand-tuned;
+         a value of 0 means "skip this bin entirely"),
+      2. a frame budget: ``max_batch_frames // get_frame_count(bin_id)``,
+         so short-clip bins get large batches and long-clip bins small ones
+         (this is what keeps GPU utilisation roughly constant across bins),
+      3. *default_batch_size* as a last resort.
+
+    OOM reductions are persisted to the JSON file so subsequent runs reuse
+    them.  The (possibly scaled-down) frame budget is persisted as well under
+    the ``__frame_budget__`` key.
     """
 
-    def __init__(self, json_path, default_batch_size=4):
+    _BUDGET_KEY = '__frame_budget__'
+
+    def __init__(self, json_path, default_batch_size=4, max_batch_frames=None,
+                 max_batch_size=64):
         self.json_path = json_path
         self.default_batch_size = default_batch_size
+        self.max_batch_frames = max_batch_frames
+        self.max_batch_size = max_batch_size
         self.batch_sizes = {}
         if osp.exists(json_path):
             with open(json_path) as f:
-                self.batch_sizes = {int(k): int(v) for k, v in json.load(f).items()}
+                data = json.load(f)
+            saved_budget = data.pop(self._BUDGET_KEY, None)
+            if max_batch_frames is not None and saved_budget is None:
+                # File written by the old fixed-size-per-bin logic; its entries
+                # come from the decrement spiral and would override the frame
+                # budget with tiny sizes, so start fresh.
+                logger.warning(
+                    'BatchManager: ignoring legacy %s (written without a frame '
+                    'budget); delete the file to silence this warning', json_path)
+            else:
+                if saved_budget is not None and max_batch_frames is not None:
+                    # The saved budget reflects past OOM-driven reductions.
+                    self.max_batch_frames = min(int(saved_budget), max_batch_frames)
+                elif saved_budget is not None:
+                    self.max_batch_frames = int(saved_budget)
+                self.batch_sizes = {int(k): int(v) for k, v in data.items()}
 
     def get(self, bin_id):
-        return max(1, self.batch_sizes.get(bin_id, self.default_batch_size))
+        if bin_id in self.batch_sizes:
+            return max(0, self.batch_sizes[bin_id])  # 0 = skip bin
+        if self.max_batch_frames:
+            bs = self.max_batch_frames // get_frame_count(bin_id)
+            return max(1, min(self.max_batch_size, bs))
+        return max(1, self.default_batch_size)
 
     def set(self, bin_id, size):
-        self.batch_sizes[bin_id] = max(1, size)
+        self.batch_sizes[bin_id] = max(0, size)
         self._save()
 
     def decrement(self, bin_id):
-        """Reduce batch size for *bin_id* by 1.  Returns True if decremented."""
+        """Reduce the batch size for *bin_id*.  Returns True if reduced.
+
+        Uses multiplicative backoff (×0.75) for large sizes so recovery from a
+        badly oversized bin takes a handful of OOMs rather than dozens, while
+        small sizes still step down by 1.
+        """
         cur = self.get(bin_id)
-        if cur > 1:
-            self.set(bin_id, cur - 1)
-            logger.info('BatchManager: bin %d batch size reduced to %d', bin_id, cur - 1)
-            return True
-        return False
+        if cur <= 1:
+            return False
+        new = min(cur - 1, max(1, int(cur * 0.75)))
+        self.set(bin_id, new)
+        logger.info('BatchManager: bin %d batch size reduced to %d', bin_id, new)
+        return True
 
     def scale_all(self, factor):
-        """Multiply every bin's batch size by *factor* (floor, minimum 1) and save.
+        """Scale the frame budget and every explicit bin entry by *factor*.
 
         Call this proactively at epoch boundaries where VRAM usage jumps
         (e.g. when discriminators or the diffusion model join training) so that
         the next epoch starts with sizes that fit in the new memory budget.
+        Scaling the budget covers bins without explicit entries too.
         """
-        all_bins = set(self.batch_sizes.keys())
-        # Also cover bins that haven't been written yet (still at default)
-        for bin_id in all_bins:
-            new_size = max(1, int(self.get(bin_id) * factor))
-            self.batch_sizes[bin_id] = new_size
+        if self.max_batch_frames:
+            self.max_batch_frames = max(1, int(self.max_batch_frames * factor))
+        for bin_id, size in list(self.batch_sizes.items()):
+            if size > 1:
+                self.batch_sizes[bin_id] = max(1, int(size * factor))
         self._save()
-        logger.info('BatchManager: all bin batch sizes scaled by %.2f', factor)
+        logger.info('BatchManager: batch sizes scaled by %.2f (frame budget now %s)',
+                    factor, self.max_batch_frames)
 
     def _save(self):
+        data = {str(k): v for k, v in self.batch_sizes.items()}
+        if self.max_batch_frames:
+            data[self._BUDGET_KEY] = self.max_batch_frames
         with open(self.json_path, 'w') as f:
-            json.dump({str(k): v for k, v in self.batch_sizes.items()}, f, indent=2)
+            json.dump(data, f, indent=2)
 
+
+# The training loops skip any batch whose ground-truth clip is shorter than
+# 80 mel frames (`if gt.size(-1) < 80: continue`).  The clip length for a bin
+# is get_frame_count(bin) - 2, so bins 0 and 1 (padded to 60/80 frames) would
+# always be skipped after wasting a full aligner/predictor forward pass.
+# Exclude them in the sampler instead.
+MIN_USABLE_BIN = 2
 
 class DynamicBatchSampler(torch.utils.data.Sampler):
     """Yields same-bin batches so every sample in a batch has the same length.
@@ -166,8 +218,17 @@ class DynamicBatchSampler(torch.utils.data.Sampler):
         self.batch_manager = batch_manager
         self.shuffle = shuffle
         self.bins = {}
+        skipped = 0
         for idx, bin_id in enumerate(dataset.sample_bins):
+            if bin_id < MIN_USABLE_BIN:
+                skipped += 1
+                continue
             self.bins.setdefault(bin_id, []).append(idx)
+        if skipped:
+            logger.warning(
+                'DynamicBatchSampler: excluded %d samples shorter than ~0.75 s '
+                '(the training loop requires >= 80-frame ground-truth clips)',
+                skipped)
 
     def __iter__(self):
         bins = {k: list(v) for k, v in self.bins.items()}
@@ -178,9 +239,9 @@ class DynamicBatchSampler(torch.utils.data.Sampler):
         batches = []
         for bin_id, indices in bins.items():
             bs = self.batch_manager.get(bin_id)
-            # drop_last when shuffling to keep batch sizes uniform
-            n = (len(indices) // bs) * bs if self.shuffle else len(indices)
-            for i in range(0, n, bs):
+            if bs <= 0:  # bin marked as skip (OOMs even at batch_size=1)
+                continue
+            for i in range(0, len(indices), bs):
                 batches.append(indices[i:i + bs])
 
         if self.shuffle:
@@ -189,10 +250,12 @@ class DynamicBatchSampler(torch.utils.data.Sampler):
         yield from batches
 
     def __len__(self):
-        return sum(
-            len(v) // self.batch_manager.get(k)
-            for k, v in self.bins.items()
-        )
+        total = 0
+        for k, v in self.bins.items():
+            bs = self.batch_manager.get(k)
+            if bs > 0:
+                total += (len(v) + bs - 1) // bs
+        return total
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +558,7 @@ def build_dataloader(path_list,
                      dataset_config={},
                      dynamic_batch=False,
                      batch_size_file='batch_sizes.json',
+                     max_batch_frames=None,
                      prefetch_factor=2,
                      persistent_workers=True):
     """Build a DataLoader for StyleTTS2 training or validation.
@@ -505,10 +569,14 @@ def build_dataloader(path_list,
     need to clip all samples to the shortest one in the batch (the clipping
     problem present in the original code).
 
-    Per-bin batch sizes are read from *batch_size_file* (JSON).  If the file
-    does not exist, *batch_size* is used as the default for every bin.
-    To handle OOM, reduce a bin's entry in the JSON and restart, or let the
-    training script call ``train_dataloader.batch_manager.decrement(bin_id)``.
+    Per-bin batch sizes are derived from *max_batch_frames* (a per-batch frame
+    budget: batch size for a bin = budget // padded bin length), overridden by
+    any explicit entries in *batch_size_file* (JSON).  When *max_batch_frames*
+    is None, *batch_size* is used as a fixed size for every bin (legacy
+    behaviour — strongly discouraged, since it starves the GPU on short bins
+    and OOMs on long ones).  To handle OOM, the training scripts call
+    ``train_dataloader.batch_manager.decrement(bin_id)``, which persists the
+    reduced size to the JSON.
     """
     dataset = FilePathDataset(
         path_list, root_path,
@@ -527,7 +595,9 @@ def build_dataloader(path_list,
         extra_kwargs['persistent_workers'] = persistent_workers
 
     if dynamic_batch and not validation:
-        batch_manager = BatchManager(batch_size_file, default_batch_size=batch_size)
+        batch_manager = BatchManager(batch_size_file,
+                                     default_batch_size=batch_size,
+                                     max_batch_frames=max_batch_frames)
         sampler = DynamicBatchSampler(dataset, batch_manager, shuffle=True)
         data_loader = DataLoader(
             dataset,

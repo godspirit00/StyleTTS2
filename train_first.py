@@ -85,6 +85,11 @@ def main(config_path):
     
     max_len = config.get('max_len', 200)
     dynamic_batch = config.get('dynamic_batch', False)
+    # Frame budget per batch: a bin of padded length L gets batch size
+    # max_batch_frames // L, so short bins get large batches and long bins
+    # small ones.  Defaults to batch_size * max_len, which matches the peak
+    # per-batch frame count of the non-dynamic code path.
+    max_batch_frames = int(config.get('max_batch_frames') or (batch_size * max_len))
     batch_size_file = osp.join(log_dir, 'batch_sizes.json')
 
     # Optional speed/memory knobs (defaults preserve old behaviour).
@@ -108,7 +113,8 @@ def main(config_path):
                                         dataset_config={},
                                         device=device,
                                         dynamic_batch=dynamic_batch,
-                                        batch_size_file=batch_size_file)
+                                        batch_size_file=batch_size_file,
+                                        max_batch_frames=max_batch_frames)
 
     # Keep a reference to the BatchManager before accelerator.prepare wraps
     # the dataloader in a DataLoaderShard, which does not preserve the custom
@@ -217,6 +223,16 @@ def main(config_path):
                 log_print('Epoch %d: batch sizes halved proactively for TMA transition' % epoch, logger)
 
         for i, batch in enumerate(train_dataloader):
+            # Pre-declare every variable the iter body assigns, so the
+            # OOM-cleanup `del` below sees them defined regardless of where
+            # the exception fired.
+            waves = texts = input_lengths = mels = mel_input_length = None
+            mask = text_mask = attn_mask = None
+            ppgs = s2s_pred = s2s_attn = mask_ST = s2s_attn_mono = None
+            t_en = asr = mel_input_length_all = None
+            en = gt = wav = st = real_norm = F0_real = s = y_rec = None
+            d_loss = loss_mel = loss_s2s = loss_mono = None
+            loss_gen_all = loss_slm = g_loss = None
             try:
                 waves = batch[0]
                 batch = [b.to(device) for b in batch[1:]]
@@ -376,16 +392,27 @@ def main(config_path):
             except RuntimeError as e:
                 if 'out of memory' in str(e).lower():
                     log_print('WARNING: OOM at step %d, skipping batch' % i, logger)
-                    torch.cuda.empty_cache()
+                    _bin = None
+                    if mel_input_length is not None:
+                        _bin = get_bin_from_mel_input_length(mel_input_length)
+                    # Drop iter-local refs so the partial autograd graph is
+                    # released NOW rather than living on into the next iter
+                    # (which is what causes the repeat-OOM spiral).
+                    del waves, batch, texts, input_lengths, mels, mel_input_length
+                    del mask, text_mask, attn_mask
+                    del ppgs, s2s_pred, s2s_attn, mask_ST, s2s_attn_mono
+                    del t_en, asr, mel_input_length_all
+                    del en, gt, wav, st, real_norm, F0_real, s, y_rec
+                    del d_loss, loss_mel, loss_s2s, loss_mono
+                    del loss_gen_all, loss_slm, g_loss
                     optimizer.zero_grad()
-                    if dynamic_batch and batch_manager is not None:
-                        try:
-                            _bin = get_bin_from_mel_input_length(mel_input_length)
-                            if batch_manager.decrement(_bin):
-                                log_print('Reduced batch size for bin %d to %d' % (
-                                    _bin, batch_manager.get(_bin)), logger)
-                        except (NameError, UnboundLocalError):
-                            pass
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    if dynamic_batch and batch_manager is not None and _bin is not None:
+                        if batch_manager.decrement(_bin):
+                            log_print('Reduced batch size for bin %d to %d' % (
+                                _bin, batch_manager.get(_bin)), logger)
                 else:
                     raise
                                 

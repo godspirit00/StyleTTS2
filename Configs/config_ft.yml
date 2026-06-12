@@ -10,6 +10,12 @@ max_len: 400 # maximum number of frames
 # from variable-length batches. Per-bin batch sizes are auto-saved to
 # batch_sizes.json in log_dir and automatically reduced when OOM is detected.
 dynamic_batch: false
+# max_batch_frames: per-batch mel-frame budget used with dynamic_batch. Each
+#   bin of padded length L gets batch size max_batch_frames // L, so bins of
+#   short clips get large batches and bins of long clips get small ones.
+#   Defaults to batch_size * max_len. Raise it if VRAM headroom remains, or
+#   lower it instead of touching batch_sizes.json on OOM.
+# max_batch_frames: 3200
 # probe_batch_max: maximum batch size to try per bin when calling
 #   probe_batch_sizes() before training (see meldataset.py). Bins that OOM
 #   even at batch_size=1 are skipped (set to 0 in batch_sizes.json).
