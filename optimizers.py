@@ -79,10 +79,16 @@ class MultiOptimizer:
             _ = [self.optimizers[key].zero_grad() for key in self.keys]
 
     def scheduler(self, *args, key=None):
-        if key is not None:
-            self.schedulers[key].step(*args)
-        else:
-            _ = [self.schedulers[key].step(*args) for key in self.keys]
+        keys = [key] if key is not None else self.keys
+        for k in keys:
+            try:
+                self.schedulers[k].step(*args)
+            except ValueError:
+                # OneCycleLR raises once it is stepped past its total_steps.
+                # With dynamic batching the real number of steps per epoch can
+                # exceed the estimate made at build time (batch sizes shrink
+                # after OOMs), so hold the final LR instead of crashing.
+                pass
 
 def define_scheduler(optimizer, params):
     scheduler = torch.optim.lr_scheduler.OneCycleLR(

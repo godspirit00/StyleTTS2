@@ -87,6 +87,11 @@ def main(config_path):
 
     max_len = config.get('max_len', 200)
     dynamic_batch = config.get('dynamic_batch', False)
+    # Frame budget per batch: a bin of padded length L gets batch size
+    # max_batch_frames // L, so short bins get large batches and long bins
+    # small ones.  Defaults to batch_size * max_len, which matches the peak
+    # per-batch frame count of the non-dynamic code path.
+    max_batch_frames = int(config.get('max_batch_frames') or (batch_size * max_len))
 
     # VRAM/speed-related options (all optional, defaults preserve old behaviour).
     mixed_precision = config.get('mixed_precision', 'no')
@@ -126,7 +131,8 @@ def main(config_path):
                                         dataset_config={},
                                         device=device,
                                         dynamic_batch=dynamic_batch,
-                                        batch_size_file=batch_size_file)
+                                        batch_size_file=batch_size_file,
+                                        max_batch_frames=max_batch_frames)
 
     val_dataloader = build_dataloader(val_list,
                                       root_path,
@@ -157,14 +163,16 @@ def main(config_path):
     model = build_model(model_params, text_aligner, pitch_extractor, plbert)
     _ = [model[key].to(device) for key in model]
 
-    # text_aligner is kept frozen during fine-tuning to preserve pretrained ASR alignment.
-    # pitch_extractor is also used purely as an inference module here.  Freeze both
-    # to avoid wasting VRAM on optimizer state for parameters that never receive grads.
-    for p in model.text_aligner.parameters():
-        p.requires_grad = False
+    # text_aligner stays TRAINABLE during fine-tuning (as in the original
+    # implementation): it produces the duration ground truth d_gt, and the
+    # TMA losses (s2s + mono) must be able to adapt it to the new dataset.
+    # Freezing it corrupts duration targets on out-of-domain data, which shows
+    # up as repeated/stuttered syllables in the finetuned model's output.
+    # pitch_extractor is purely an inference module here (all call sites are
+    # wrapped in torch.no_grad and it is never stepped), so keep it frozen to
+    # avoid wasting VRAM on optimizer state.
     for p in model.pitch_extractor.parameters():
         p.requires_grad = False
-    model.text_aligner.eval()
     model.pitch_extractor.eval()
 
     # DP
@@ -282,9 +290,10 @@ def main(config_path):
         start_time = time.time()
 
         _ = [model[key].eval() for key in model]
-        
+
+        model.text_aligner.train()
         model.text_encoder.train()
-        
+
         model.predictor.train()
         model.bert_encoder.train()
         model.bert.train()
@@ -555,6 +564,7 @@ def main(config_path):
                 optimizer.step('decoder')
 
                 optimizer.step('text_encoder')
+                optimizer.step('text_aligner')
 
                 if epoch >= diff_epoch:
                     optimizer.step('diffusion')

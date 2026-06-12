@@ -88,6 +88,11 @@ def main(config_path):
 
     max_len = config.get('max_len', 200)
     dynamic_batch = config.get('dynamic_batch', False)
+    # Frame budget per batch: a bin of padded length L gets batch size
+    # max_batch_frames // L, so short bins get large batches and long bins
+    # small ones.  Defaults to batch_size * max_len, which matches the peak
+    # per-batch frame count of the non-dynamic code path.
+    max_batch_frames = int(config.get('max_batch_frames') or (batch_size * max_len))
 
     # VRAM/speed-related options (all optional, defaults preserve old behaviour).
     mixed_precision = config.get('mixed_precision', 'no')
@@ -127,7 +132,8 @@ def main(config_path):
                                         dataset_config={},
                                         device=device,
                                         dynamic_batch=dynamic_batch,
-                                        batch_size_file=batch_size_file)
+                                        batch_size_file=batch_size_file,
+                                        max_batch_frames=max_batch_frames)
 
     val_dataloader = build_dataloader(val_list,
                                       root_path,
