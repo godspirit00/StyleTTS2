@@ -91,6 +91,14 @@ class MultiOptimizer:
                 pass
 
 def define_scheduler(optimizer, params):
+    steps_per_epoch = params.get('steps_per_epoch', 1000)
+    if steps_per_epoch < 1:
+        raise ValueError(
+            'steps_per_epoch is %r, i.e. the training dataloader is empty. '
+            'With dynamic_batch this usually means every sample was binned as '
+            'too short: check the FilePathDataset warnings above for files '
+            'whose length could not be read, and verify data_params.root_path '
+            'and the paths in your train list.' % steps_per_epoch)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=params.get('max_lr', 2e-4),

@@ -384,18 +384,57 @@ class FilePathDataset(torch.utils.data.Dataset):
             self._precompute_bins()
 
     def _precompute_bins(self):
-        """Read audio file headers (no decode) and assign each sample to a bin."""
+        """Assign every sample to a length bin.
+
+        Tries the fast path first: read the frame count from the file header
+        via ``sf.info`` (no decode).  Some formats/headers report ``frames==0``
+        or raise, so on any such failure we fall back to actually decoding the
+        file to measure its true length.  A silent ``n_samples = 0`` fallback
+        (the previous behaviour) is dangerous: it sends every affected sample
+        to bin 0, which the sampler then excludes, silently emptying the whole
+        dataset.  We warn loudly instead so the cause is visible.
+        """
         self.sample_bins = []
+        n_header_fail = 0
+        n_decode_fail = 0
+        first_error = None
         for data in self.data_list:
             wave_path = data[0]
+            full_path = osp.join(self.root_path, wave_path)
+            n_samples = 0
             try:
-                info = sf.info(osp.join(self.root_path, wave_path))
+                info = sf.info(full_path)
                 n_samples = info.frames
-                if info.samplerate != self.sr:
+                if n_samples and info.samplerate != self.sr:
                     n_samples = int(n_samples * self.sr / info.samplerate)
-            except Exception:
-                n_samples = 0
+            except Exception as e:
+                first_error = first_error or ('%s: %s' % (wave_path, e))
+
+            if n_samples <= 0:
+                # Header missing/unreliable — decode to measure true length.
+                n_header_fail += 1
+                try:
+                    wave, sr = sf.read(full_path)
+                    n_samples = wave.shape[0]
+                    if sr != self.sr:
+                        n_samples = int(n_samples * self.sr / sr)
+                except Exception as e:
+                    n_decode_fail += 1
+                    first_error = first_error or ('%s: %s' % (wave_path, e))
+                    n_samples = 0
             self.sample_bins.append(get_time_bin(n_samples))
+
+        if n_header_fail:
+            logger.warning(
+                'FilePathDataset: %d/%d files had no usable length in their '
+                'header; fell back to decoding them (slower startup). First '
+                'issue: %s', n_header_fail, len(self.data_list), first_error)
+        if n_decode_fail:
+            logger.error(
+                'FilePathDataset: %d/%d files could not be read at all and were '
+                'binned as length 0 (they will be dropped). Check root_path and '
+                'file paths. First error: %s',
+                n_decode_fail, len(self.data_list), first_error)
 
     def __len__(self):
         return len(self.data_list)
