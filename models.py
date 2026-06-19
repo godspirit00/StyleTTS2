@@ -698,18 +698,60 @@ def load_checkpoint(model, optimizer, path, load_only_params=True, ignore_module
     params = state['net']
 
     for key in model:
-        if key in params and key not in ignore_modules:
-            try:
-                model[key].load_state_dict(params[key], strict=True)
-            except:
-                from collections import OrderedDict
-                state_dict = params[key]
-                new_state_dict = OrderedDict()
-                print(f'{key} key length: {len(model[key].state_dict().keys())}, state_dict key length: {len(state_dict.keys())}')
-                for (k_m, v_m), (k_c, v_c) in zip(model[key].state_dict().items(), state_dict.items()):
-                    new_state_dict[k_m] = v_c
-                model[key].load_state_dict(new_state_dict, strict=True)
+        if key not in params or key in ignore_modules:
+            continue
+        try:
+            model[key].load_state_dict(params[key], strict=True)
             print('%s loaded' % key)
+            continue
+        except RuntimeError:
+            pass
+
+        # Strict load failed: do a safe, name- and shape-matched partial load.
+        # Copy every parameter whose name AND shape match the checkpoint; record
+        # the rest.  This intentionally does NOT fall back to copying tensors by
+        # position (the previous behaviour), because a positional copy silently
+        # loads unrelated weights into the wrong parameters whenever the two
+        # state dicts happen to share a shape — corrupting the model.
+        model_sd = model[key].state_dict()
+        ckpt_sd = params[key]
+        matched, shape_mismatch, missing = {}, [], []
+        for name, tgt in model_sd.items():
+            if name not in ckpt_sd:
+                missing.append(name)
+            elif ckpt_sd[name].shape != tgt.shape:
+                shape_mismatch.append(
+                    '%s (checkpoint %s vs model %s)'
+                    % (name, tuple(ckpt_sd[name].shape), tuple(tgt.shape)))
+            else:
+                matched[name] = ckpt_sd[name]
+
+        # Shape mismatches mean the architectures genuinely differ — most often
+        # because the decoder config does not match the checkpoint.  Loading
+        # would be meaningless, so stop with an actionable message.
+        if shape_mismatch:
+            hint = ''
+            if key == 'decoder':
+                hint = (
+                    "\n\nThis is almost always a decoder-config mismatch: the "
+                    "model_params.decoder block in your config does not match "
+                    "the pretrained model.  iSTFTNet decoders have "
+                    "noise_convs with (gen_istft_n_fft + 2) input channels and "
+                    "len(upsample_rates) layers; HiFiGAN decoders have 1 input "
+                    "channel.  Set decoder.type and its upsample_rates / "
+                    "upsample_kernel_sizes / gen_istft_* to match the checkpoint "
+                    "you are loading.")
+            preview = '\n  '.join(shape_mismatch[:8])
+            more = '' if len(shape_mismatch) <= 8 else (
+                '\n  ... and %d more' % (len(shape_mismatch) - 8))
+            raise RuntimeError(
+                "load_checkpoint: %d parameter(s) in module '%s' have mismatched "
+                "shapes and cannot be loaded:\n  %s%s%s"
+                % (len(shape_mismatch), key, preview, more, hint))
+
+        model[key].load_state_dict(matched, strict=False)
+        print('%s partially loaded: %d/%d tensors (%d missing in checkpoint)'
+              % (key, len(matched), len(model_sd), len(missing)))
 
     if not load_only_params:
         epoch = state["epoch"]
@@ -718,5 +760,5 @@ def load_checkpoint(model, optimizer, path, load_only_params=True, ignore_module
     else:
         epoch = 0
         iters = 0
-        
+
     return model, optimizer, epoch, iters
