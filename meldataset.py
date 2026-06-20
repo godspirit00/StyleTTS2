@@ -162,14 +162,14 @@ class BatchManager:
     def decrement(self, bin_id):
         """Reduce the batch size for *bin_id*.  Returns True if reduced.
 
-        Uses multiplicative backoff (×0.75) for large sizes so recovery from a
-        badly oversized bin takes a handful of OOMs rather than dozens, while
+        Halves large sizes so recovery from a badly oversized bin converges in
+        a few OOMs (log2) rather than dozens of single-step decrements, while
         small sizes still step down by 1.
         """
         cur = self.get(bin_id)
         if cur <= 1:
             return False
-        new = min(cur - 1, max(1, int(cur * 0.75)))
+        new = min(cur - 1, max(1, cur // 2))
         self.set(bin_id, new)
         logger.info('BatchManager: bin %d batch size reduced to %d', bin_id, new)
         return True
@@ -236,26 +236,50 @@ class DynamicBatchSampler(torch.utils.data.Sampler):
             for indices in bins.values():
                 random.shuffle(indices)
 
-        batches = []
-        for bin_id, indices in bins.items():
-            bs = self.batch_manager.get(bin_id)
-            if bs <= 0:  # bin marked as skip (OOMs even at batch_size=1)
-                continue
-            for i in range(0, len(indices), bs):
-                batches.append(indices[i:i + bs])
-
+        bin_order = list(bins.keys())
         if self.shuffle:
-            random.shuffle(batches)
+            random.shuffle(bin_order)
 
-        yield from batches
+        # Emit batches lazily, round-robin across bins, reading the batch size
+        # from the BatchManager at the moment each batch is produced.  This is
+        # what makes OOM recovery work WITHIN an epoch: when the training loop
+        # catches an OOM and decrements a bin, the very next batch drawn from
+        # that bin uses the reduced size (after the DataLoader's prefetch queue,
+        # ~2*num_workers batches, drains).  Building the whole batch list up
+        # front instead would freeze the oversized sizes for the entire epoch.
+        cursors = {k: 0 for k in bin_order}
+        remaining = sum(len(v) for v in bins.values())
+        while remaining > 0:
+            progressed = False
+            for bin_id in bin_order:
+                indices = bins[bin_id]
+                c = cursors[bin_id]
+                if c >= len(indices):
+                    continue
+                bs = self.batch_manager.get(bin_id)
+                if bs <= 0:  # bin marked as skip (OOMs even at batch_size=1)
+                    remaining -= (len(indices) - c)
+                    cursors[bin_id] = len(indices)
+                    continue
+                batch = indices[c:c + bs]
+                cursors[bin_id] = c + len(batch)
+                remaining -= len(batch)
+                progressed = True
+                yield batch
+            if not progressed:
+                break
 
     def __len__(self):
+        # Estimate based on the current batch sizes; the real count can be
+        # larger if OOMs shrink batch sizes mid-epoch.  Used only for progress
+        # display and the scheduler's steps_per_epoch estimate (the scheduler
+        # is guarded against overshoot).
         total = 0
         for k, v in self.bins.items():
             bs = self.batch_manager.get(k)
             if bs > 0:
                 total += (len(v) + bs - 1) // bs
-        return total
+        return max(1, total)
 
 
 # ---------------------------------------------------------------------------
