@@ -17,6 +17,8 @@ issues in the pinyin→IPA frontend:
 | `fix_pinyin2ipa_table.py` | Rewrites the known-bad rows in your `pinyin2ipa.txt`, leaving everything else untouched. Run once. |
 | `preprocess_biaobei.py` | Builds a StyleTTS2 `train_list` from BiaoBei/BZNSYP, using the corpus's `#1 #2 #3 #4` prosody labels for prosodic-word grouping. |
 | `hanzi_to_ipa_grouped.py` | Inference-time `hanzi_to_ipa()` that groups syllables into words with `jieba`, matching the training convention. |
+| `CHINESE_PLBERT_NOTES.md` | Handoff note for training a drop-in Chinese PL-BERT. |
+| `DECISIONS.md` | Running record of what we changed and what we deliberately left alone (aligner, SLM/WavLM) and why. |
 
 ## Workflow
 
