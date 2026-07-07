@@ -15,6 +15,14 @@ Usage:
         --stage1_ckpt Models/epoch_1st_00XX.pth --asr_config Utils/ASR/config.yml \
         --out_dir diag_finetuned
 
+    # control: stock aligner on the SAME audio but with tone arrows removed
+    python diagnose_aligner.py --val_list Data/val_list.txt --root_path Data/wavs \
+        --aligner Utils/ASR/epoch_00080.pth --asr_config Utils/ASR/config.yml \
+        --strip_arrows --out_dir diag_stock_noarrows
+
+Use Utils/extract_text_aligner.py to pull a standalone text_aligner .pth out of
+an epoch_1st_*.pth if you'd rather load it via --aligner.
+
 Read the printed summary + the saved attention PNGs. See the interpretation
 notes at the bottom of this file.
 """
@@ -32,6 +40,29 @@ from text_utils import symbols  # index -> symbol, to label arrows/vowels
 
 TONE_ARROWS = set("→↗↓↘")
 VOWELS = set("aeiouɑɐɒæɔəɚɛɜɤʊʌyɪ")   # rough IPA vowel set for bucketing
+ARROW_IDS = {i for i, s in enumerate(symbols) if s in TONE_ARROWS}
+
+
+def strip_arrow_tokens(texts, input_lengths, pad_id=0):
+    """Remove tone-arrow tokens from a padded (B, T) text batch, left-shifting
+    survivors and decrementing each row's length. The mel/audio side is left
+    untouched, so this is a controlled "same audio, tone-free phonemes" probe:
+    if a stock aligner aligns markedly better here than with arrows present,
+    the arrows are out-of-distribution for it."""
+    B = texts.size(0)
+    new_lengths = input_lengths.clone()
+    rows = []
+    for b in range(B):
+        L = int(input_lengths[b])
+        keep = [texts[b, t] for t in range(L) if int(texts[b, t]) not in ARROW_IDS]
+        new_lengths[b] = len(keep)
+        rows.append(keep)
+    Tmax = int(new_lengths.max())
+    new_texts = torch.full((B, Tmax), pad_id, dtype=texts.dtype, device=texts.device)
+    for b, keep in enumerate(rows):
+        for j, v in enumerate(keep):
+            new_texts[b, j] = v
+    return new_texts, new_lengths
 
 
 def load_aligner(args, device):
@@ -56,6 +87,10 @@ def main():
     ap.add_argument("--out_dir", default="diag_aligner")
     ap.add_argument("--n_batches", type=int, default=50)
     ap.add_argument("--n_plots", type=int, default=20)
+    ap.add_argument("--strip_arrows", action="store_true",
+                    help="control run: drop tone-arrow tokens so the aligner sees "
+                         "tone-free phonemes on the same audio (isolates whether "
+                         "the arrows are what breaks alignment)")
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -81,6 +116,9 @@ def main():
         # batch = [waves, texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ...]
         texts, input_lengths, _, _, mels, mel_input_length, _ = [
             b.to(device) if torch.is_tensor(b) else b for b in batch[1:8]]
+
+        if args.strip_arrows:
+            texts, input_lengths = strip_arrow_tokens(texts, input_lengths)
 
         with torch.no_grad():
             mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
@@ -170,8 +208,15 @@ if __name__ == "__main__":
 #    or std for 'arrow' means the duration TARGETS your whole model learned from
 #    are noisy -> retrain the aligner (AuxiliaryASR) on your exact G2P.
 #
+# 5) --strip_arrows CONTROL — run the SAME (usually stock) aligner twice, once
+#    normally and once with --strip_arrows. If mono loss drops a lot / matrices
+#    sharpen once arrows are removed, the arrows are what the aligner chokes on
+#    (they are OOD for it). If alignment is already clean WITH arrows, tones are
+#    not the problem and retraining the aligner for tones won't help.
+#
 # DECISION:
 #   fine-tuned aligner: clean matrices + low mono loss + arrows ~0/consistent
 #       -> aligner is FINE, prosody problem is elsewhere (PL-BERT / segmentation)
-#   fine-tuned aligner: still blurry / high mono loss / bad arrow stats
+#   fine-tuned aligner: still blurry / high mono loss / bad arrow stats,
+#       AND --strip_arrows on the stock aligner is markedly cleaner
 #       -> RETRAIN the text aligner on Chinese with your arrow-tone G2P
