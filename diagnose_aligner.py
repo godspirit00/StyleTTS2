@@ -149,7 +149,8 @@ def main():
                     recall_tot[bucket] += 1
                     if int(pred[b, t]) == int(texts[b, t]):
                         recall_hit[bucket] += 1
-                s2s_accs.append(float((pred[b, 1:L+1] == texts[b, :L]).float().mean()))
+                # s2s_pred[t] predicts texts[t] (no shift; matches train_first.py:339-340)
+                s2s_accs.append(float((pred[b, :L] == texts[b, :L]).float().mean()))
 
             # (3) save a few attention heatmaps with arrow rows highlighted
             for b in range(texts.size(0)):
