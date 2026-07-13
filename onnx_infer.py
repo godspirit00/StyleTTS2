@@ -22,6 +22,7 @@ import types
 import argparse
 
 import numpy as np
+import onnx
 import onnxruntime as ort
 
 
@@ -62,8 +63,28 @@ def _adpm2_sigmas(sigma, sigma_next):
     return sigma_up, sigma_down, sigma_mid
 
 
+def _make_decoder_deterministic(path):
+    """Return decoder model bytes with the two random nodes (RandomNormalLike
+    for the noise excitation, RandomUniformLike for the harmonic initial phase)
+    replaced by deterministic zeros (Sub(x, x)). onnxruntime advances its RNG
+    across run() calls even with a fixed seed attribute, so removing the random
+    ops is the reliable way to get bit-exact, reproducible output."""
+    m = onnx.load(path)
+    for n in m.graph.node:
+        if n.op_type in ("RandomNormalLike", "RandomUniformLike"):
+            xin = n.input[0]
+            yout = n.output[0]
+            del n.attribute[:]
+            n.op_type = "Sub"
+            del n.input[:]
+            n.input.extend([xin, xin])
+            del n.output[:]
+            n.output.extend([yout])
+    return m.SerializeToString()
+
+
 class StyleTTS2ONNX:
-    def __init__(self, model_dir, providers=None):
+    def __init__(self, model_dir, providers=None, deterministic=False, seed=0):
         with open(os.path.join(model_dir, "meta.json"), encoding="utf-8") as f:
             self.meta = json.load(f)
         if providers is None:
@@ -71,6 +92,8 @@ class StyleTTS2ONNX:
             providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
                          if "CUDAExecutionProvider" in avail else ["CPUExecutionProvider"])
         so = ort.SessionOptions()
+        self.deterministic = deterministic
+        self.default_seed = seed
 
         def sess(name):
             return ort.InferenceSession(os.path.join(model_dir, name), so, providers=providers)
@@ -78,7 +101,12 @@ class StyleTTS2ONNX:
         self.encoder = sess("encoder.onnx")
         self.diffusion = sess("diffusion.onnx")
         self.predictor = sess("predictor.onnx")
-        self.decoder = sess("decoder.onnx")
+        if deterministic:
+            self.decoder = ort.InferenceSession(
+                _make_decoder_deterministic(os.path.join(model_dir, "decoder.onnx")),
+                so, providers=providers)
+        else:
+            self.decoder = sess("decoder.onnx")
         self.tokenizer = TextCleaner()
         self.style_dim = self.meta["style_dim"]
         self.noise_dim = self.meta["noise_dim"]
@@ -117,8 +145,13 @@ class StyleTTS2ONNX:
     # ---- full pipeline -----------------------------------------------------
     def inference(self, phonemes, additional_ph=None, speed=1.0,
                   diffusion_steps=5, embedding_scale=1.0, s_prev=None,
-                  alpha=0.7, seed=0):
-        """Single-speaker inference matching inference2() + the workaround."""
+                  alpha=0.7, seed=None):
+        """Single-speaker inference matching inference2() + the workaround.
+
+        With deterministic=True (set on the constructor) and a fixed seed, the
+        output is bit-exact reproducible across runs."""
+        if seed is None:
+            seed = self.default_seed
         rng = np.random.default_rng(seed)
 
         tokens_orig = self._tokens(phonemes.strip())
@@ -183,6 +216,8 @@ if __name__ == "__main__":
     p.add_argument("--steps", type=int, default=5)
     p.add_argument("--scale", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--deterministic", action="store_true",
+                   help="bit-exact reproducible output (zeros the decoder noise excitation)")
     p.add_argument("--filler", default="That's what we have for now.",
                    help="filler sentence appended then removed for short inputs")
     p.add_argument("--no-filler", action="store_true")
@@ -195,7 +230,7 @@ if __name__ == "__main__":
     def phon(text):
         return " ".join(word_tokenize(gp.phonemize([text])[0]))
 
-    model = StyleTTS2ONNX(args.m)
+    model = StyleTTS2ONNX(args.m, deterministic=args.deterministic, seed=args.seed)
 
     ph = phon(args.t)
     add_ph = None

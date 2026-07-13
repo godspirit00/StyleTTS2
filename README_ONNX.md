@@ -9,7 +9,7 @@ Files:
 | file | purpose |
 |------|---------|
 | `onnx_export.py` | checkpoint (`.pth` + `config.yml`) → 4 ONNX graphs + `meta.json` |
-| `onnx_infer.py`  | `StyleTTS2ONNX` runtime (numpy + onnxruntime) + CLI |
+| `onnx_infer.py`  | `StyleTTS2ONNX` low-level runtime (numpy + onnxruntime) + CLI |
 | `onnx_stft.py`   | ONNX-friendly STFT/iSTFT (replaces `torch.istft`, which is not exportable) |
 | `test_parity.py` | validates the ONNX graphs against the original PyTorch model |
 
@@ -68,6 +68,21 @@ audio, s_prev = m.inference(phonemes,
 `additional_ph` is the phonemized filler sentence appended to the end; its tokens
 (and the joining space) are removed by zeroing their durations, identical to the
 single-speaker `inference2()` path in the wrapper.
+
+## Deterministic mode
+
+The decoder's harmonic source uses a random initial phase and additive noise
+(two `Random*Like` ops), so output varies run-to-run. Passing
+`deterministic=True` (on `StyleTTS2ONNX` or `TTSModelONNX`, or `--deterministic`
+on either CLI) rewrites those two nodes to deterministic zeros at load time, so
+a given `(text, seed)` produces **bit-exact** output every run. Impact on
+quality is negligible — the averaged magnitude spectrum matches the stochastic
+output at correlation ≈ 0.999.
+
+Note: onnxruntime advances its RNG across `run()` calls even with a fixed `seed`
+attribute, which is why zeroing the nodes (rather than seeding them) is the
+reliable route to reproducibility. For bit-exact results use the CPU provider;
+GPU float reductions can differ in the last bits.
 
 ## Validation
 
