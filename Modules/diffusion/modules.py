@@ -5,35 +5,17 @@ from .utils import *
 
 import torch
 import torch.nn as nn
-import torch.utils.checkpoint as cp
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 from einops_exts import rearrange_many
 from torch import Tensor, einsum
 
 
-# Module-level flag toggled by training scripts that want gradient
-# checkpointing on the transformer blocks (cuts activation memory).
-_USE_GRADIENT_CHECKPOINTING = False
+from ..utils import maybe_checkpoint, set_gradient_checkpointing  # noqa: F401
 
 
-def set_gradient_checkpointing(enabled: bool) -> None:
-    """Enable/disable gradient checkpointing in the diffusion transformers."""
-    global _USE_GRADIENT_CHECKPOINTING
-    _USE_GRADIENT_CHECKPOINTING = bool(enabled)
-
-
-def _maybe_checkpoint(module, *args, **kwargs):
-    """Run ``module(*args, **kwargs)`` under gradient checkpointing if it is
-    enabled and the inputs require grad, otherwise plain call.
-    """
-    if _USE_GRADIENT_CHECKPOINTING and torch.is_grad_enabled():
-        # use_reentrant=False matches modern PyTorch recommendation.
-        try:
-            return cp.checkpoint(module, *args, use_reentrant=False, **kwargs)
-        except TypeError:
-            return cp.checkpoint(module, *args, **kwargs)
-    return module(*args, **kwargs)
+def _maybe_checkpoint(module, *args):
+    return maybe_checkpoint('diffusion', module, *args)
 
 
 """

@@ -5,40 +5,66 @@ device: "cuda"
 epochs: 50 # number of finetuning epoch (1 hour of data)
 batch_size: 8
 max_len: 400 # maximum number of frames
-# Dynamic batching: groups samples into length bins so every item in a batch
-# has the same padded length. Eliminates cross-sample clipping and avoids OOM
-# from variable-length batches. Per-bin batch sizes are auto-saved to
-# batch_sizes.json in log_dir and automatically reduced when OOM is detected.
-dynamic_batch: false
-# max_batch_frames: per-batch mel-frame budget used with dynamic_batch. Each
-#   bin of padded length L gets batch size max_batch_frames // L, so bins of
-#   short clips get large batches and bins of long clips get small ones.
-#   Defaults to batch_size * max_len. Raise it if VRAM headroom remains, or
-#   lower it instead of touching batch_sizes.json on OOM.
+# ---------------------------------------------------------------------------
+# Batching.  With dynamic_batch (recommended) every utterance is put in a
+# 0.25 s length bin and padded to the bin length; batches come from a single
+# bin and the WHOLE utterance is used for training.  (The original code crops
+# every item of a random batch to the shortest one, so segments get shorter
+# and more random the larger the batch; set dynamic_batch: false to get it.)
+# ---------------------------------------------------------------------------
+dynamic_batch: true
+# max_batch_frames: mel frames per batch (1 frame = 12.5 ms).  A bin of padded
+#   length L gets batch size max_batch_frames // L, so short clips get big
+#   batches and long clips small ones.  Defaults to batch_size * max_len.
+#   Batch sizes that OOM are reduced automatically, sizes that fit grow back
+#   (never to a size that has OOMed), per training phase; the learned sizes are
+#   kept in log_dir/batch_sizes_<stage>.json and reused by later runs.
 # max_batch_frames: 3200
-# probe_batch_max: maximum batch size to try per bin when calling
-#   probe_batch_sizes() before training (see meldataset.py). Bins that OOM
-#   even at batch_size=1 are skipped (set to 0 in batch_sizes.json).
-# probe_batch_max: 16
-# vram_reserve_mb: MiB to pre-allocate during probing so estimates are
-#   conservative (real training has additional backward-pass overhead).
-# vram_reserve_mb: 512
+# max_segment_len: cap (in mel frames) on the training segment length with
+#   dynamic_batch; null = whole utterances.  max_len is only used by the
+#   legacy path and for the default max_batch_frames.
+max_segment_len: null
+max_batch_size: 64
+# phase_batch_scale: start a phase at a fraction of the budget sizes the first
+#   time it is entered, e.g. {second_joint: 0.5}.  Phases: first, first_tma,
+#   second, second_diff, second_joint, ft, ft_diff, ft_joint.
+# phase_batch_scale: {}
 pretrained_model: "Models/LibriTTS/epochs_2nd_00020.pth"
 second_stage_load_pretrained: true # set to true if the pre-trained model is for 2nd stage
 load_only_params: true # set to true if do not want to load epoch numbers and optimizer parameters
 
 # ---------------------------------------------------------------------------
-# VRAM / speed knobs (see Configs/config.yml for full documentation).
+# VRAM / speed / stability knobs (every training script supports all of them)
 # ---------------------------------------------------------------------------
-mixed_precision: 'no'         # 'no' | 'bf16' (fp16 only for Accelerate scripts)
-gradient_checkpointing: false # checkpointing inside diffusion transformer
-use_8bit_optimizer: false     # bitsandbytes AdamW8bit (~4x smaller state)
-disc_update_freq: 1           # update mpd/msd every N steps
-diffusion_num_steps_min: 3    # sampler steps per training iter (randint min)
-diffusion_num_steps_max: 5    # sampler steps per training iter (randint max)
-num_workers: 2                # DataLoader worker processes
+# mixed_precision: 'no' | 'bf16' | 'fp16'.  bf16 (Ampere+: A100, RTX 30/40,
+#   H100) roughly halves activation memory.  fp16 (T4, V100, RTX 20) uses a
+#   GradScaler; steps with inf/NaN gradients are skipped automatically.
+#   `accelerate launch --mixed_precision=...` is honoured when this is 'no'.
+mixed_precision: 'no'
+# gradient_checkpointing: recompute the decoder (HiFiGAN/iSTFTNet) residual
+#   blocks and the diffusion transformer in the backward pass.  Large cut in
+#   activation memory (the decoder dominates it) for ~20-30% more compute.
+gradient_checkpointing: false
+# use_8bit_optimizer: bitsandbytes AdamW8bit (~4x smaller optimizer state);
+#   falls back to AdamW when bitsandbytes is not installed.
+use_8bit_optimizer: false
+# disc_update_freq: update the discriminators every N generator steps.
+disc_update_freq: 1
+# diffusion sampler steps per training iteration: randint(min, max) (orig. 3, 5)
+diffusion_num_steps_min: 3
+diffusion_num_steps_max: 5
+# grad_clip_norm: clip each module's gradient norm (null = off).  Steps whose
+#   gradients are not finite are always skipped instead of corrupting weights.
+grad_clip_norm: 5.0
+# lr_schedule: 'constant' (original) or 'warmup_cosine' (10% warmup
+#   (lr_warmup) then cosine decay to lr/1000, driven by epoch progress so it
+#   is unaffected by changing batch counts).
+lr_schedule: 'warmup_cosine'
+num_workers: 2                  # DataLoader workers
+allow_tf32: true                # TF32 matmuls/convs on Ampere+ (faster, harmless)
+cudnn_benchmark: false          # cuDNN autotuning; only helps with few distinct shapes
 cuda_expandable_segments: true  # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-                                # to reduce VRAM fragmentation with dynamic_batch
+                                # (less VRAM fragmentation with varying shapes)
 
 F0_path: "Utils/JDC/bst.t7"
 ASR_config: "Utils/ASR/config.yml"

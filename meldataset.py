@@ -1,49 +1,52 @@
 #coding: utf-8
 import os
 import os.path as osp
-import time
 import random
+import json
+import logging
+
 import numpy as np
-import random
 import soundfile as sf
 import librosa
-import json
+import pandas as pd  # noqa: F401  (kept for backwards compatibility of imports)
 
 import torch
-from torch import nn
-import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import DataLoader
 
-import logging
+# The symbol table MUST be identical to the one used at inference time
+# (text_utils.py); keep a single source of truth.
+from text_utils import symbols, dicts
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-import pandas as pd
+# PL-BERT has 512 position embeddings; texts are wrapped in two pad tokens.
+MAX_TEXT_TOKENS = 510
 
-_pad = "$"
-_punctuation = ';:,.!?¡¿—…"«»"" '
-_letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
-_letters_ipa = "ɑɐɒæɓʙβɔɕçɗɖðʤəɘɚɛɜɝɞɟʄɡɠɢʛɦɧħɥʜɨɪʝɭɬɫɮʟɱɯɰŋɳɲɴøɵɸθœɶʘɹɺɾɻʀʁɽʂʃʈʧʉʊʋⱱʌɣɤʍχʎʏʑʐʒʔʡʕʢǀǁǂǃˈˌːˑʼʴʰʱʲʷˠˤ˞↓↑→↗↘'̩'ᵻ"
-
-# Export all symbols:
-symbols = [_pad] + list(_punctuation) + list(_letters) + list(_letters_ipa)
-
-dicts = {}
-for i in range(len((symbols))):
-    dicts[symbols[i]] = i
 
 class TextCleaner:
+    """Maps a phoneme string to token ids, silently skipping unknown chars
+    (they are reported once per character instead of once per sample)."""
+
+    _reported = set()
+
     def __init__(self, dummy=None):
         self.word_index_dictionary = dicts
+
     def __call__(self, text):
         indexes = []
         for char in text:
-            try:
-                indexes.append(self.word_index_dictionary[char])
-            except KeyError:
-                print(text)
+            idx = self.word_index_dictionary.get(char)
+            if idx is None:
+                if char not in TextCleaner._reported:
+                    TextCleaner._reported.add(char)
+                    logger.warning('TextCleaner: unknown symbol %r dropped (first seen in: %s)',
+                                   char, text.strip()[:80])
+                continue
+            indexes.append(idx)
         return indexes
+
 
 np.random.seed(1)
 random.seed(1)
@@ -60,307 +63,314 @@ to_mel = torchaudio.transforms.MelSpectrogram(
     n_mels=80, n_fft=2048, win_length=1200, hop_length=300)
 mean, std = -4, 4
 
+
 def preprocess(wave):
     wave_tensor = torch.from_numpy(wave).float()
     mel_tensor = to_mel(wave_tensor)
     mel_tensor = (torch.log(1e-5 + mel_tensor.unsqueeze(0)) - mean) / std
     return mel_tensor
 
+
 # ---------------------------------------------------------------------------
-# Dynamic batching helpers
+# Dynamic batching
 # ---------------------------------------------------------------------------
+# The original code builds random batches and then crops *every* sample to the
+# length of the shortest one in the batch, so the larger the batch the shorter
+# (and more random) the training segments become.  With dynamic batching every
+# sample is assigned to a length bin, zero-padded (symmetrically, like the
+# original 5000-sample padding) to the bin's fixed length, and batches are
+# drawn from a single bin.  All items of a batch therefore have exactly the
+# same length and the training scripts use the full padded utterance - no
+# cross-sample cropping at all.  The batch size of each bin is derived from a
+# frame budget (short clips -> big batches, long clips -> small batches).
+
 _HOP_LENGTH = 300  # must match SPECT_PARAMS hop_length
+_BIN_FRAMES = 20   # width of one bin in mel frames (0.25 s)
+
 
 def get_time_bin(sample_count):
-    """Map audio sample count to a bin index.
-
-    Each bin covers 20 mel frames (~0.25 s at 24 kHz / hop 300).
-    Bin 0 covers the shortest samples (fewer than 20 frames of audio).
-    """
+    """Map an audio sample count to a bin index (bin k: [20+20k, 40+20k) frames)."""
     frames = sample_count // _HOP_LENGTH
     if frames >= 20:
-        return (frames - 20) // 20
+        return (frames - 20) // _BIN_FRAMES
     return 0
 
-def get_frame_count(bin_id):
-    """Return the padded mel-frame target for a given bin.
 
-    Bin 0 → 60 frames, bin k → 60 + 20*k frames.
-    The +40 headroom over the bin's lower boundary guarantees the actual
-    audio always fits inside the target without truncation.
-    """
-    return bin_id * 20 + 60
+def get_frame_count(bin_id):
+    """Padded mel-frame length of a bin: 60 + 20*bin.
+
+    The bin's longest clip has < 40 + 20*bin frames, so every clip gets
+    between ~10 and ~20 frames (0.125-0.25 s) of silence on each side,
+    comparable to the original fixed 5000-sample padding."""
+    return bin_id * _BIN_FRAMES + 60
+
 
 def get_bin_from_mel_input_length(mel_input_length):
-    """Recover the bin id from a batch's padded mel-frame tensor.
-
-    With dynamic batching every sample in a batch has the same padded length
-    equal to get_frame_count(bin_id) = 60 + 20*bin_id.  Inverting:
-        bin_id = (frame_count - 60) // 20
-    Safe to call even if mel_input_length has minor rounding; always >= 0.
-    """
+    """Recover the bin id from a dynamic batch's mel lengths (all equal)."""
     frame_count = int(mel_input_length.min().item())
-    return max(0, (frame_count - 60) // 20)
+    return max(0, (frame_count - 60) // _BIN_FRAMES)
+
+
+# Bin 0 (60 frames) is shorter than the 80 frames the style encoder needs.
+MIN_USABLE_BIN = 1
 
 
 class BatchManager:
-    """Decides the batch size for each length bin.
+    """Decides (and learns) the batch size of every length bin.
 
-    The per-bin size comes from three sources, in priority order:
-      1. an explicit entry in the JSON file (OOM-reduced or hand-tuned;
-         a value of 0 means "skip this bin entirely"),
-      2. a frame budget: ``max_batch_frames // get_frame_count(bin_id)``,
-         so short-clip bins get large batches and long-clip bins small ones
-         (this is what keeps GPU utilisation roughly constant across bins),
-      3. *default_batch_size* as a last resort.
+    * Sizes come from a frame budget: ``max_batch_frames // bin_frames``
+      (clamped to [1, max_batch_size]).
+    * Memory use differs a lot between training phases (e.g. before/after the
+      discriminators, diffusion or SLM adversarial training join), so sizes are
+      tracked per *phase* (see :meth:`set_phase`); a phase can start from a
+      scaled-down budget.
+    * On OOM the bin's size is reduced (x0.75) and the failing size is
+      remembered as a ceiling for that phase.  Bins that OOM repeatedly even at
+      batch size 1 are skipped (0) for the phase, with a warning.
+    * After ``grow_interval`` consecutive successful batches a bin whose size
+      is below its budget size grows again (x1.125), never reaching a size that
+      has OOMed, so an over-conservative start does not waste the GPU forever.
 
-    OOM reductions are persisted to the JSON file so subsequent runs reuse
-    them.  The (possibly scaled-down) frame budget is persisted as well under
-    the ``__frame_budget__`` key.
+    Everything is persisted to ``json_path`` so a later run (or a resumed run)
+    starts from the learned sizes.  Only the main process writes the file.
     """
 
-    _BUDGET_KEY = '__frame_budget__'
+    VERSION = 2
 
-    def __init__(self, json_path, default_batch_size=4, max_batch_frames=None,
-                 max_batch_size=64):
+    def __init__(self, json_path, max_batch_frames, max_batch_size=64,
+                 grow_interval=50, skip_after_ooms_at_1=3, is_main_process=True):
         self.json_path = json_path
-        self.default_batch_size = default_batch_size
-        self.max_batch_frames = max_batch_frames
-        self.max_batch_size = max_batch_size
-        self.batch_sizes = {}
-        if osp.exists(json_path):
-            with open(json_path) as f:
+        self.max_batch_frames = int(max_batch_frames)
+        self.max_batch_size = int(max_batch_size)
+        self.grow_interval = int(grow_interval)
+        self.skip_after_ooms_at_1 = int(skip_after_ooms_at_1)
+        self.is_main_process = is_main_process
+        self.phases = {}
+        self._load()
+        self.phase = None
+        self.set_phase('default')
+        self._success = {}
+        self._ooms_at_1 = {}
+
+    # -- persistence --------------------------------------------------------
+    def _load(self):
+        if not self.json_path or not osp.exists(self.json_path):
+            return
+        try:
+            with open(self.json_path) as f:
                 data = json.load(f)
-            saved_budget = data.pop(self._BUDGET_KEY, None)
-            if max_batch_frames is not None and saved_budget is None:
-                # File written by the old fixed-size-per-bin logic; its entries
-                # come from the decrement spiral and would override the frame
-                # budget with tiny sizes, so start fresh.
-                logger.warning(
-                    'BatchManager: ignoring legacy %s (written without a frame '
-                    'budget); delete the file to silence this warning', json_path)
-            else:
-                if saved_budget is not None and max_batch_frames is not None:
-                    # The saved budget reflects past OOM-driven reductions.
-                    self.max_batch_frames = min(int(saved_budget), max_batch_frames)
-                elif saved_budget is not None:
-                    self.max_batch_frames = int(saved_budget)
-                self.batch_sizes = {int(k): int(v) for k, v in data.items()}
-
-    def get(self, bin_id):
-        if bin_id in self.batch_sizes:
-            return max(0, self.batch_sizes[bin_id])  # 0 = skip bin
-        if self.max_batch_frames:
-            bs = self.max_batch_frames // get_frame_count(bin_id)
-            return max(1, min(self.max_batch_size, bs))
-        return max(1, self.default_batch_size)
-
-    def set(self, bin_id, size):
-        self.batch_sizes[bin_id] = max(0, size)
-        self._save()
-
-    def decrement(self, bin_id):
-        """Reduce the batch size for *bin_id*.  Returns True if reduced.
-
-        Halves large sizes so recovery from a badly oversized bin converges in
-        a few OOMs (log2) rather than dozens of single-step decrements, while
-        small sizes still step down by 1.
-        """
-        cur = self.get(bin_id)
-        if cur <= 1:
-            return False
-        new = min(cur - 1, max(1, cur // 2))
-        self.set(bin_id, new)
-        logger.info('BatchManager: bin %d batch size reduced to %d', bin_id, new)
-        return True
-
-    def scale_all(self, factor):
-        """Scale the frame budget and every explicit bin entry by *factor*.
-
-        Call this proactively at epoch boundaries where VRAM usage jumps
-        (e.g. when discriminators or the diffusion model join training) so that
-        the next epoch starts with sizes that fit in the new memory budget.
-        Scaling the budget covers bins without explicit entries too.
-        """
-        if self.max_batch_frames:
-            self.max_batch_frames = max(1, int(self.max_batch_frames * factor))
-        for bin_id, size in list(self.batch_sizes.items()):
-            if size > 1:
-                self.batch_sizes[bin_id] = max(1, int(size * factor))
-        self._save()
-        logger.info('BatchManager: batch sizes scaled by %.2f (frame budget now %s)',
-                    factor, self.max_batch_frames)
+        except (OSError, ValueError) as e:
+            logger.warning('BatchManager: could not read %s (%s); starting fresh',
+                           self.json_path, e)
+            return
+        if not isinstance(data, dict) or data.get('version') != self.VERSION:
+            logger.warning('BatchManager: ignoring %s written by an older version '
+                           '(delete it to silence this warning)', self.json_path)
+            return
+        for name, ph in data.get('phases', {}).items():
+            if int(ph.get('budget', -1)) != self.max_batch_frames:
+                # The user changed max_batch_frames: learned sizes are stale.
+                continue
+            self.phases[name] = {
+                'budget': self.max_batch_frames,
+                'scale': float(ph.get('scale', 1.0)),
+                'sizes': {int(k): int(v) for k, v in ph.get('sizes', {}).items()},
+                'ceil': {int(k): int(v) for k, v in ph.get('ceil', {}).items()},
+            }
 
     def _save(self):
-        data = {str(k): v for k, v in self.batch_sizes.items()}
-        if self.max_batch_frames:
-            data[self._BUDGET_KEY] = self.max_batch_frames
-        with open(self.json_path, 'w') as f:
-            json.dump(data, f, indent=2)
+        if not self.is_main_process or not self.json_path:
+            return
+        data = {'version': self.VERSION, 'phases': {}}
+        for name, ph in self.phases.items():
+            data['phases'][name] = {
+                'budget': ph['budget'], 'scale': ph['scale'],
+                'sizes': {str(k): v for k, v in sorted(ph['sizes'].items())},
+                'ceil': {str(k): v for k, v in sorted(ph['ceil'].items())},
+            }
+        tmp = self.json_path + '.tmp'
+        try:
+            with open(tmp, 'w') as f:
+                json.dump(data, f, indent=1)
+            os.replace(tmp, self.json_path)
+        except OSError as e:
+            logger.warning('BatchManager: could not write %s (%s)', self.json_path, e)
 
+    # -- phases ---------------------------------------------------------------
+    def set_phase(self, name, scale=1.0):
+        """Switch to phase *name*.  A phase seen before (in this or an earlier
+        run with the same budget) resumes its learned sizes; a new phase starts
+        at ``scale`` x the budget sizes."""
+        if name == self.phase:
+            return
+        if name not in self.phases:
+            self.phases[name] = {'budget': self.max_batch_frames, 'scale': float(scale),
+                                 'sizes': {}, 'ceil': {}}
+        self.phase = name
+        self._ph = self.phases[name]
+        self._success = {}
+        self._ooms_at_1 = {}
+        self._save()
 
-# The training loops skip any batch whose ground-truth clip is shorter than
-# 80 mel frames (`if gt.size(-1) < 80: continue`).  The clip length for a bin
-# is get_frame_count(bin) - 2, so bins 0 and 1 (padded to 60/80 frames) would
-# always be skipped after wasting a full aligner/predictor forward pass.
-# Exclude them in the sampler instead.
-MIN_USABLE_BIN = 2
+    # -- sizes ----------------------------------------------------------------
+    def target(self, bin_id):
+        """Budget-derived batch size for a bin (the growth target)."""
+        bs = self.max_batch_frames // get_frame_count(bin_id)
+        return max(1, min(self.max_batch_size, bs))
+
+    def get(self, bin_id):
+        sizes = self._ph['sizes']
+        if bin_id in sizes:
+            return sizes[bin_id]
+        return max(1, int(self.target(bin_id) * self._ph['scale']))
+
+    def _set(self, bin_id, size):
+        self._ph['sizes'][bin_id] = int(size)
+        self._save()
+
+    def on_oom(self, bin_id, used_size):
+        """Record an OOM for a batch of ``used_size`` items from ``bin_id``.
+        Returns the new batch size of the bin (0 = bin skipped)."""
+        cur = self.get(bin_id)
+        ceil = self._ph['ceil']
+        ceil[bin_id] = min(ceil.get(bin_id, used_size), used_size)
+        self._success[bin_id] = 0
+        if used_size > cur:
+            # A batch that was prefetched before the last reduction: the size
+            # has already been lowered, don't shrink again.
+            self._save()
+            return cur
+        if cur <= 1:
+            n = self._ooms_at_1.get(bin_id, 0) + 1
+            self._ooms_at_1[bin_id] = n
+            if n >= self.skip_after_ooms_at_1:
+                logger.warning(
+                    'BatchManager[%s]: bin %d (%d frames, %.2f s) runs out of memory '
+                    'even with batch size 1; skipping it for this phase. Lower '
+                    'max_len/max_segment_len, enable gradient_checkpointing or '
+                    'mixed_precision, or split long utterances.', self.phase,
+                    bin_id, get_frame_count(bin_id), get_frame_count(bin_id) * _HOP_LENGTH / 24000)
+                self._set(bin_id, 0)
+                return 0
+            self._save()
+            return 1
+        new = min(cur - 1, max(1, int(cur * 0.75)))
+        self._set(bin_id, new)
+        logger.info('BatchManager[%s]: OOM in bin %d at batch size %d -> %d',
+                    self.phase, bin_id, used_size, new)
+        return new
+
+    def on_success(self, bin_id, used_size):
+        """Record a successful training step; may grow the bin's batch size."""
+        cur = self.get(bin_id)
+        if cur <= 0 or used_size < cur:
+            return
+        self._ooms_at_1.pop(bin_id, None)
+        n = self._success.get(bin_id, 0) + 1
+        if n < self.grow_interval:
+            self._success[bin_id] = n
+            return
+        self._success[bin_id] = 0
+        limit = min(self.target(bin_id), self._ph['ceil'].get(bin_id, 1 << 30) - 1)
+        if cur < limit:
+            new = min(limit, cur + max(1, cur // 8))
+            self._set(bin_id, new)
+            logger.info('BatchManager[%s]: bin %d batch size grown %d -> %d',
+                        self.phase, bin_id, cur, new)
+
+    # Backwards-compatible alias used by older scripts.
+    def decrement(self, bin_id):
+        before = self.get(bin_id)
+        return self.on_oom(bin_id, before) < before
+
 
 class DynamicBatchSampler(torch.utils.data.Sampler):
-    """Yields same-bin batches so every sample in a batch has the same length.
+    """Yields batches whose items all come from the same length bin.
 
-    This eliminates cross-sample clipping: because all items share the same
-    padded length, the training loop's "clip to shortest" code becomes a no-op
-    (random_start is always 0, mel_len equals the full sample length).
+    Batches are generated lazily, reading the bin's batch size from the
+    :class:`BatchManager` at the moment the batch is produced, so OOM
+    reductions / growth take effect within the epoch (after the DataLoader's
+    small prefetch queue drains).  Bins are interleaved randomly, weighted by
+    the number of samples they still hold, so every part of the epoch sees a
+    mix of lengths.
+
+    For multi-process (DDP) training every rank uses the same seeded RNG and
+    therefore produces the same sequence of global batches; each global batch
+    holds ``batch_size * num_replicas`` items and rank ``r`` takes items
+    ``r::num_replicas``.  Global batches that cannot give every rank at least
+    one item are dropped so all ranks run the same number of steps.
     """
 
-    def __init__(self, dataset, batch_manager, shuffle=True):
+    def __init__(self, dataset, batch_manager, shuffle=True, num_replicas=1,
+                 rank=0, seed=0):
         self.batch_manager = batch_manager
         self.shuffle = shuffle
+        self.num_replicas = max(1, int(num_replicas))
+        self.rank = int(rank)
+        self.seed = seed
+        self.epoch = 0
         self.bins = {}
         skipped = 0
         for idx, bin_id in enumerate(dataset.sample_bins):
+            if bin_id is None:
+                continue  # unreadable / filtered sample
             if bin_id < MIN_USABLE_BIN:
                 skipped += 1
                 continue
             self.bins.setdefault(bin_id, []).append(idx)
         if skipped:
             logger.warning(
-                'DynamicBatchSampler: excluded %d samples shorter than ~0.75 s '
-                '(the training loop requires >= 80-frame ground-truth clips)',
-                skipped)
+                'DynamicBatchSampler: excluded %d samples shorter than ~0.5 s '
+                '(the style encoder needs >= 80 mel frames)', skipped)
+        if not self.bins:
+            raise ValueError(
+                'DynamicBatchSampler: no usable training samples. Check '
+                'data_params.root_path and the paths in your train list.')
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
 
     def __iter__(self):
-        bins = {k: list(v) for k, v in self.bins.items()}
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1  # a fresh order next time even if set_epoch is never called
+        bins = {k: list(v) for k, v in sorted(self.bins.items())}
         if self.shuffle:
             for indices in bins.values():
-                random.shuffle(indices)
+                rng.shuffle(indices)
+        cursors = {k: 0 for k in bins}
+        world = self.num_replicas
 
-        bin_order = list(bins.keys())
-        if self.shuffle:
-            random.shuffle(bin_order)
-
-        # Emit batches lazily, round-robin across bins, reading the batch size
-        # from the BatchManager at the moment each batch is produced.  This is
-        # what makes OOM recovery work WITHIN an epoch: when the training loop
-        # catches an OOM and decrements a bin, the very next batch drawn from
-        # that bin uses the reduced size (after the DataLoader's prefetch queue,
-        # ~2*num_workers batches, drains).  Building the whole batch list up
-        # front instead would freeze the oversized sizes for the entire epoch.
-        cursors = {k: 0 for k in bin_order}
-        remaining = sum(len(v) for v in bins.values())
-        while remaining > 0:
-            progressed = False
-            for bin_id in bin_order:
-                indices = bins[bin_id]
-                c = cursors[bin_id]
-                if c >= len(indices):
-                    continue
-                bs = self.batch_manager.get(bin_id)
-                if bs <= 0:  # bin marked as skip (OOMs even at batch_size=1)
-                    remaining -= (len(indices) - c)
-                    cursors[bin_id] = len(indices)
-                    continue
-                batch = indices[c:c + bs]
-                cursors[bin_id] = c + len(batch)
-                remaining -= len(batch)
-                progressed = True
-                yield batch
-            if not progressed:
-                break
+        while True:
+            live = [k for k in bins if cursors[k] < len(bins[k])]
+            if not live:
+                return
+            if self.shuffle:
+                weights = [len(bins[k]) - cursors[k] for k in live]
+                bin_id = rng.choices(live, weights=weights)[0]
+            else:
+                bin_id = live[0]
+            indices = bins[bin_id]
+            c = cursors[bin_id]
+            bs = self.batch_manager.get(bin_id)
+            if bs <= 0:  # bin skipped for this phase
+                cursors[bin_id] = len(indices)
+                continue
+            glob = indices[c:c + bs * world]
+            cursors[bin_id] = c + len(glob)
+            if len(glob) < world:
+                continue
+            yield glob[self.rank::world]
 
     def __len__(self):
-        # Estimate based on the current batch sizes; the real count can be
-        # larger if OOMs shrink batch sizes mid-epoch.  Used only for progress
-        # display and the scheduler's steps_per_epoch estimate (the scheduler
-        # is guarded against overshoot).
+        # Estimate from the current sizes (OOM reductions can make an epoch
+        # longer; the LR schedule is driven by epoch progress, not this).
         total = 0
+        world = self.num_replicas
         for k, v in self.bins.items():
-            bs = self.batch_manager.get(k)
+            bs = self.batch_manager.get(k) * world
             if bs > 0:
-                total += (len(v) + bs - 1) // bs
+                total += len(v) // bs + (1 if len(v) % bs >= world else 0)
         return max(1, total)
-
-
-# ---------------------------------------------------------------------------
-# Batch-size probe
-# ---------------------------------------------------------------------------
-
-def probe_batch_sizes(dataset, batch_manager, test_fn, vram_reserve_mb=512, logger=None):
-    """Calibrate per-bin batch sizes before training starts.
-
-    Iterates bins from shortest to longest.  For each bin calls *test_fn(batch)*
-    (a full forward+backward training step) with the current batch size.  On OOM
-    the batch size is decremented and the step is retried; bins that still OOM at
-    batch_size=1 are set to 0 (skipped during training).  Results are persisted
-    to ``batch_manager.json_path`` so subsequent runs reuse them.
-
-    Args:
-        dataset:          A :class:`FilePathDataset` with ``dynamic_batch=True``
-                          (i.e. ``sample_bins`` already populated).
-        batch_manager:    The :class:`BatchManager` whose sizes will be updated.
-        test_fn:          ``callable(batch) -> None`` — runs one training step.
-                          Should raise ``RuntimeError`` on OOM.
-        vram_reserve_mb:  MiB to pre-allocate before probing so that estimates
-                          are conservative (real training has other overhead).
-        logger:           Optional logger for progress messages.
-    """
-    import gc
-    from collections import defaultdict
-
-    _log = (lambda msg: logger.info(msg)) if logger else (lambda msg: None)
-
-    # Group indices by bin
-    bins = defaultdict(list)
-    for idx, bin_id in enumerate(dataset.sample_bins):
-        bins[bin_id].append(idx)
-
-    # Reserve VRAM so probe estimates are conservative
-    reserve = None
-    if vram_reserve_mb > 0:
-        n_elems = vram_reserve_mb * 1024 * 1024 // 4  # float32
-        try:
-            reserve = torch.zeros(n_elems, dtype=torch.float32, device='cuda')
-            _log(f'Probe: reserved {vram_reserve_mb} MiB of VRAM')
-        except RuntimeError:
-            _log('Probe: could not reserve VRAM, probing without reserve')
-
-    collate_fn = Collater()
-
-    for bin_id in sorted(bins.keys()):
-        indices = bins[bin_id]
-        while True:
-            bs = batch_manager.get(bin_id)
-            if bs == 0:
-                _log(f'Probe: bin {bin_id} marked as skip')
-                break
-            if len(indices) < bs:
-                _log(f'Probe: bin {bin_id} has fewer samples than batch_size={bs}, keeping as-is')
-                break
-            try:
-                batch = collate_fn([dataset[i] for i in indices[:bs]])
-                test_fn(batch)
-                _log(f'Probe: bin {bin_id} -> batch_size={bs} OK')
-                break
-            except RuntimeError as e:
-                if 'out of memory' not in str(e).lower():
-                    raise
-                torch.cuda.empty_cache()
-                gc.collect()
-                _log(f'Probe: bin {bin_id} OOM at batch_size={bs}')
-                if not batch_manager.decrement(bin_id):
-                    # Already at 1 and still OOM — skip this bin
-                    batch_manager.set(bin_id, 0)
-                    _log(f'Probe: bin {bin_id} skipped (batch_size=1 still OOMs)')
-                    break
-
-    if reserve is not None:
-        del reserve
-        torch.cuda.empty_cache()
-        gc.collect()
-
-    batch_manager._save()
-    _log('Probe complete — batch_sizes.json updated')
 
 
 # ---------------------------------------------------------------------------
@@ -377,19 +387,34 @@ class FilePathDataset(torch.utils.data.Dataset):
                  OOD_data="Data/OOD_texts.txt",
                  min_length=50,
                  dynamic_batch=False,
+                 multispeaker=True,
                  ):
 
-        spect_params = SPECT_PARAMS
-        mel_params = MEL_PARAMS
-
-        _data_list = [l.strip().split('|') for l in data_list]
-        self.data_list = [data if len(data) == 3 else (*data, 0) for data in _data_list]
         self.text_cleaner = TextCleaner()
         self.sr = sr
+        self.multispeaker = multispeaker
 
-        self.df = pd.DataFrame(self.data_list)
+        _data_list = [l.strip().split('|') for l in data_list if l.strip()]
+        data_list = []
+        n_long = 0
+        for data in _data_list:
+            data = list(data[:3]) if len(data) >= 3 else [*data, '0']
+            # PL-BERT only has 512 positions; longer texts crash the model
+            # ("index out of range in self"), so drop them up front.
+            if len(self.text_cleaner(data[1])) > MAX_TEXT_TOKENS:
+                n_long += 1
+                continue
+            data_list.append(tuple(data))
+        if n_long:
+            logger.warning('FilePathDataset: dropped %d samples with more than %d '
+                           'phoneme tokens (PL-BERT limit); split them into '
+                           'shorter utterances to use them', n_long, MAX_TEXT_TOKENS)
+        self.data_list = data_list
 
-        self.to_melspec = torchaudio.transforms.MelSpectrogram(**MEL_PARAMS)
+        # speaker -> sample indices, for sampling style references quickly
+        self.speaker_index = {}
+        for i, data in enumerate(self.data_list):
+            self.speaker_index.setdefault(str(data[2]), []).append(i)
 
         self.mean, self.std = -4, 4
         self.data_augmentation = data_augmentation and (not validation)
@@ -399,25 +424,23 @@ class FilePathDataset(torch.utils.data.Dataset):
         with open(OOD_data, 'r', encoding='utf-8') as f:
             tl = f.readlines()
         idx = 1 if '.wav' in tl[0].split('|')[0] else 0
-        self.ptexts = [t.split('|')[idx] for t in tl]
+        ptexts = [t.split('|')[idx] for t in tl if len(t.split('|')) > idx]
+        # OOD texts feed PL-BERT in SLM adversarial training: same 512 limit.
+        self.ptexts = [t for t in ptexts
+                       if len(self.text_cleaner(t)) <= MAX_TEXT_TOKENS]
+        self._ood_long = [t for t in self.ptexts if len(t) >= self.min_length]
 
         self.root_path = root_path
         self.dynamic_batch = dynamic_batch
+        self._warned_sr = False
 
+        self.sample_bins = None
         if dynamic_batch:
             self._precompute_bins()
 
     def _precompute_bins(self):
-        """Assign every sample to a length bin.
-
-        Tries the fast path first: read the frame count from the file header
-        via ``sf.info`` (no decode).  Some formats/headers report ``frames==0``
-        or raise, so on any such failure we fall back to actually decoding the
-        file to measure its true length.  A silent ``n_samples = 0`` fallback
-        (the previous behaviour) is dangerous: it sends every affected sample
-        to bin 0, which the sampler then excludes, silently emptying the whole
-        dataset.  We warn loudly instead so the cause is visible.
-        """
+        """Assign every sample to a length bin (reads file headers only;
+        falls back to decoding when the header has no usable length)."""
         self.sample_bins = []
         n_header_fail = 0
         n_decode_fail = 0
@@ -435,7 +458,6 @@ class FilePathDataset(torch.utils.data.Dataset):
                 first_error = first_error or ('%s: %s' % (wave_path, e))
 
             if n_samples <= 0:
-                # Header missing/unreliable — decode to measure true length.
                 n_header_fail += 1
                 try:
                     wave, sr = sf.read(full_path)
@@ -446,7 +468,7 @@ class FilePathDataset(torch.utils.data.Dataset):
                     n_decode_fail += 1
                     first_error = first_error or ('%s: %s' % (wave_path, e))
                     n_samples = 0
-            self.sample_bins.append(get_time_bin(n_samples))
+            self.sample_bins.append(get_time_bin(n_samples) if n_samples > 0 else None)
 
         if n_header_fail:
             logger.warning(
@@ -455,10 +477,9 @@ class FilePathDataset(torch.utils.data.Dataset):
                 'issue: %s', n_header_fail, len(self.data_list), first_error)
         if n_decode_fail:
             logger.error(
-                'FilePathDataset: %d/%d files could not be read at all and were '
-                'binned as length 0 (they will be dropped). Check root_path and '
-                'file paths. First error: %s',
-                n_decode_fail, len(self.data_list), first_error)
+                'FilePathDataset: %d/%d files could not be read at all and '
+                'will be skipped. Check root_path and file paths. First '
+                'error: %s', n_decode_fail, len(self.data_list), first_error)
 
     def __len__(self):
         return len(self.data_list)
@@ -468,8 +489,7 @@ class FilePathDataset(torch.utils.data.Dataset):
         path = data[0]
 
         if self.dynamic_batch:
-            bin_id = self.sample_bins[idx]
-            frame_count = get_frame_count(bin_id)
+            frame_count = get_frame_count(self.sample_bins[idx])
             wave, text_tensor, speaker_id = self._load_tensor(data, frame_count)
         else:
             wave, text_tensor, speaker_id = self._load_tensor(data)
@@ -480,22 +500,21 @@ class FilePathDataset(torch.utils.data.Dataset):
         length_feature = acoustic_feature.size(1)
         acoustic_feature = acoustic_feature[:, :(length_feature - length_feature % 2)]
 
-        # get reference sample
-        ref_data = (self.df[self.df[2] == str(speaker_id)]).sample(n=1).iloc[0].tolist()
-        ref_mel_tensor, ref_label = self._load_data(ref_data[:3])
+        # Reference sample of the same speaker (only used by multi-speaker
+        # models; single-speaker training skips the extra file read).
+        if self.multispeaker:
+            ref_idx = random.choice(self.speaker_index[str(data[2])])
+            ref_mel_tensor, ref_label = self._load_data(self.data_list[ref_idx])
+        else:
+            ref_mel_tensor, ref_label = torch.zeros(80, 1), speaker_id
 
         # get OOD text
-        ps = ""
-
-        while len(ps) < self.min_length:
-            rand_idx = np.random.randint(0, len(self.ptexts) - 1)
-            ps = self.ptexts[rand_idx]
-
-            text = self.text_cleaner(ps)
-            text.insert(0, 0)
-            text.append(0)
-
-            ref_text = torch.LongTensor(text)
+        pool = self._ood_long if self._ood_long else self.ptexts
+        ps = pool[np.random.randint(0, len(pool))]
+        text = self.text_cleaner(ps)
+        text.insert(0, 0)
+        text.append(0)
+        ref_text = torch.LongTensor(text)
 
         return speaker_id, acoustic_feature, text_tensor, ref_text, ref_mel_tensor, ref_label, path, wave
 
@@ -503,27 +522,25 @@ class FilePathDataset(torch.utils.data.Dataset):
         wave_path, text, speaker_id = data
         speaker_id = int(speaker_id)
         wave, sr = sf.read(osp.join(self.root_path, wave_path))
-        if wave.shape[-1] == 2:
-            wave = wave[:, 0].squeeze()
-        if sr != 24000:
-            wave = librosa.resample(wave, orig_sr=sr, target_sr=24000)
-            print(wave_path, sr)
+        if wave.ndim == 2:
+            wave = wave[:, 0]
+        if sr != self.sr:
+            if not self._warned_sr:
+                self._warned_sr = True
+                logger.warning('Resampling %s from %d Hz to %d Hz on the fly (slow); '
+                               'resample the dataset beforehand', wave_path, sr, self.sr)
+            wave = librosa.resample(wave, orig_sr=sr, target_sr=self.sr)
 
         if frame_count is not None:
-            # Pad symmetrically to exactly frame_count * hop_length samples.
-            # Because all samples in the same bin are padded to the same length,
-            # the collater and training loop never need to clip across samples.
+            # Pad symmetrically to exactly frame_count * hop_length samples, so
+            # every item of a same-bin batch has the same length.
             target = frame_count * _HOP_LENGTH
             if len(wave) > target:
                 wave = wave[:target]
-            else:
-                pad_total = target - len(wave)
-                pad_start = pad_total // 2
-                wave = np.concatenate([
-                    np.zeros(pad_start),
-                    wave,
-                    np.zeros(pad_total - pad_start),
-                ])
+            pad_total = target - len(wave)
+            pad_start = pad_total // 2
+            wave = np.concatenate([np.zeros(pad_start), wave,
+                                   np.zeros(pad_total - pad_start)])
         else:
             wave = np.concatenate([np.zeros([5000]), wave, np.zeros([5000])], axis=0)
 
@@ -549,20 +566,13 @@ class FilePathDataset(torch.utils.data.Dataset):
 
 
 class Collater(object):
-    """
-    Args:
-      adaptive_batch_size (bool): if true, decrease batch size when long data comes.
-    """
-
     def __init__(self, return_wave=False):
         self.text_pad_index = 0
         self.min_mel_length = 192
         self.max_mel_length = 192
         self.return_wave = return_wave
 
-
     def __call__(self, batch):
-        # batch[0] = wave, mel, text, f0, speakerid
         batch_size = len(batch)
 
         # sort by mel length
@@ -622,31 +632,27 @@ def build_dataloader(path_list,
                      dynamic_batch=False,
                      batch_size_file='batch_sizes.json',
                      max_batch_frames=None,
+                     max_batch_size=64,
+                     num_replicas=1,
+                     rank=0,
                      prefetch_factor=2,
                      persistent_workers=True):
     """Build a DataLoader for StyleTTS2 training or validation.
 
-    When *dynamic_batch* is True the dataset pre-scans audio lengths, groups
-    samples into fixed-length bins, and uses :class:`DynamicBatchSampler` so
-    that every item in a batch has the same padded length.  This removes the
-    need to clip all samples to the shortest one in the batch (the clipping
-    problem present in the original code).
-
-    Per-bin batch sizes are derived from *max_batch_frames* (a per-batch frame
-    budget: batch size for a bin = budget // padded bin length), overridden by
-    any explicit entries in *batch_size_file* (JSON).  When *max_batch_frames*
-    is None, *batch_size* is used as a fixed size for every bin (legacy
-    behaviour — strongly discouraged, since it starves the GPU on short bins
-    and OOMs on long ones).  To handle OOM, the training scripts call
-    ``train_dataloader.batch_manager.decrement(bin_id)``, which persists the
-    reduced size to the JSON.
+    With *dynamic_batch* (training only) samples are grouped into length bins
+    and batched per bin by :class:`DynamicBatchSampler`; the batch size of
+    each bin is managed by a :class:`BatchManager` (attached to the returned
+    loader as ``.batch_manager``) whose frame budget is *max_batch_frames*
+    (defaults to ``batch_size * 400``).  Otherwise this is the original
+    random-batch loader (``.batch_manager`` is None).
     """
+    use_dynamic = dynamic_batch and not validation
     dataset = FilePathDataset(
         path_list, root_path,
         OOD_data=OOD_data,
         min_length=min_length,
         validation=validation,
-        dynamic_batch=dynamic_batch and (not validation),
+        dynamic_batch=use_dynamic,
         **dataset_config,
     )
     collate_fn = Collater(**collate_config)
@@ -656,31 +662,38 @@ def build_dataloader(path_list,
     if num_workers > 0:
         extra_kwargs['prefetch_factor'] = prefetch_factor
         extra_kwargs['persistent_workers'] = persistent_workers
+    pin = (str(device) != 'cpu') and torch.cuda.is_available()
 
-    if dynamic_batch and not validation:
+    if use_dynamic:
         batch_manager = BatchManager(batch_size_file,
-                                     default_batch_size=batch_size,
-                                     max_batch_frames=max_batch_frames)
-        sampler = DynamicBatchSampler(dataset, batch_manager, shuffle=True)
+                                     max_batch_frames=max_batch_frames or batch_size * 400,
+                                     max_batch_size=max_batch_size,
+                                     is_main_process=(rank == 0))
+        sampler = DynamicBatchSampler(dataset, batch_manager, shuffle=True,
+                                      num_replicas=num_replicas, rank=rank)
         data_loader = DataLoader(
             dataset,
             batch_sampler=sampler,
             num_workers=num_workers,
             collate_fn=collate_fn,
-            pin_memory=(device != 'cpu'),
+            pin_memory=pin,
             **extra_kwargs,
         )
-        # Attach batch_manager so training scripts can access it for OOM handling
         data_loader.batch_manager = batch_manager
     else:
+        sampler = None
+        if num_replicas > 1 and not validation:
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset, num_replicas=num_replicas, rank=rank, shuffle=True, drop_last=True)
         data_loader = DataLoader(
             dataset,
             batch_size=batch_size,
-            shuffle=(not validation),
+            shuffle=(not validation) and sampler is None,
+            sampler=sampler,
             num_workers=num_workers,
             drop_last=(not validation),
             collate_fn=collate_fn,
-            pin_memory=(device != 'cpu'),
+            pin_memory=pin,
             **extra_kwargs,
         )
         data_loader.batch_manager = None

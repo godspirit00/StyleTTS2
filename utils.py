@@ -18,11 +18,11 @@ def maximum_path(neg_cent, mask):
   """
   device = neg_cent.device
   dtype = neg_cent.dtype
-  neg_cent =  np.ascontiguousarray(neg_cent.data.cpu().numpy().astype(np.float32))
+  neg_cent =  np.ascontiguousarray(neg_cent.data.float().cpu().numpy().astype(np.float32))
   path =  np.ascontiguousarray(np.zeros(neg_cent.shape, dtype=np.int32))
 
-  t_t_max = np.ascontiguousarray(mask.sum(1)[:, 0].data.cpu().numpy().astype(np.int32))
-  t_s_max = np.ascontiguousarray(mask.sum(2)[:, 0].data.cpu().numpy().astype(np.int32))
+  t_t_max = np.ascontiguousarray(mask.long().sum(1)[:, 0].data.cpu().numpy().astype(np.int32))
+  t_s_max = np.ascontiguousarray(mask.long().sum(2)[:, 0].data.cpu().numpy().astype(np.int32))
   maximum_path_c(path, neg_cent, t_t_max, t_s_max)
   return torch.from_numpy(path).to(device=device, dtype=dtype)
 
@@ -77,48 +77,20 @@ def log_print(message, logger):
 # Training helpers: mixed precision + gradient checkpointing
 # ---------------------------------------------------------------------------
 
-def resolve_amp_dtype(spec):
-    """Map a config 'mixed_precision' value to (autocast_enabled, dtype).
-
-    Accepted spec values:
-        - "no" / False / None / ""   -> AMP disabled
-        - "bf16" / "bfloat16"        -> autocast(bf16) (Ampere+ / cuda 8.0+)
-
-    fp16 is rejected because the manual-AMP scripts (train_second.py,
-    train_finetune.py) issue multiple ``backward()`` calls per iteration and
-    the GradScaler integration required to keep fp16 stable is not wired in.
-    Use ``bf16`` on Ampere+ GPUs, or use the Accelerate-based scripts
-    (train_first.py / train_finetune_accelerate.py) which scale internally.
-    """
-    if spec is None or spec is False:
-        return False, torch.float32
-    if isinstance(spec, str):
-        s = spec.strip().lower()
-        if s in ("no", "none", "off", "false", ""):
-            return False, torch.float32
-        if s in ("bf16", "bfloat16"):
-            return True, torch.bfloat16
-        if s in ("fp16", "float16", "half"):
-            raise ValueError(
-                "mixed_precision='fp16' is not supported in the manual-AMP "
-                "training scripts because GradScaler is not wired into the "
-                "multi-backward loop and unscaled fp16 grads will overflow. "
-                "Use 'bf16' instead, or switch to the Accelerate-based "
-                "scripts (train_first.py / train_finetune_accelerate.py).")
-    raise ValueError(f"Unrecognized mixed_precision value: {spec!r}")
+def enable_gradient_checkpointing(enabled, targets=('decoder', 'diffusion')):
+    """Toggle activation checkpointing for the decoder (HiFiGAN / iSTFTNet
+    residual blocks - the largest activation consumer) and the style-diffusion
+    transformer.  Trades one extra forward pass of those blocks for a large
+    cut in activation memory."""
+    from Modules.utils import set_gradient_checkpointing
+    if isinstance(targets, str):
+        targets = (targets,)
+    set_gradient_checkpointing(bool(enabled), tuple(targets))
 
 
+# Backwards-compatible name.
 def enable_diffusion_gradient_checkpointing(enabled: bool) -> None:
-    """Toggle gradient checkpointing inside the diffusion transformer blocks.
-
-    Cuts activation memory at the cost of one extra forward pass per block
-    during backward.  Safe to call before training starts.
-    """
-    try:
-        from Modules.diffusion.modules import set_gradient_checkpointing
-        set_gradient_checkpointing(enabled)
-    except Exception:
-        pass
+    enable_gradient_checkpointing(enabled)
 
 
 def freeze_module(module):

@@ -45,9 +45,10 @@ class STFTLoss(torch.nn.Module):
         """
         # cuFFT does not support half precision on all GPUs and is numerically
         # touchy at fp16 in general; force fp32 here so AMP training still works.
-        with torch.cuda.amp.autocast(enabled=False):
-            x = x.float()
-            y = y.float()
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            # accept [B, 1, T] or [B, T] for both inputs
+            x = _as_batch_2d(x)
+            y = _as_batch_2d(y)
             x_mag = self.to_mel(x)
             mean, std = -4, 4
             x_mag = (torch.log(1e-5 + x_mag) - mean) / std
@@ -132,13 +133,25 @@ def generator_loss(disc_outputs):
 
     return loss, gen_losses
 
+def _tprls_rel(dr, dg):
+    """Relativistic term of the TPRLS loss.
+
+    The original ``torch.mean(x[mask])`` is NaN whenever the mask selects no
+    element (e.g. all real/fake score differences are equal), which poisons
+    the whole generator/discriminator loss.  Treat that case as zero instead.
+    """
+    diff = (dr - dg).float()
+    m_DG = torch.median(diff)
+    mask = diff < m_DG
+    sq = (diff - m_DG) ** 2
+    return (sq * mask).sum() / mask.sum().clamp(min=1)
+
 """ https://dl.acm.org/doi/abs/10.1145/3573834.3574506 """
 def discriminator_TPRLS_loss(disc_real_outputs, disc_generated_outputs):
     loss = 0
     for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
         tau = 0.04
-        m_DG = torch.median((dr-dg))
-        L_rel = torch.mean((((dr - dg) - m_DG)**2)[dr < dg + m_DG])
+        L_rel = _tprls_rel(dr, dg)
         loss += tau - F.relu(tau - L_rel)
     return loss
 
@@ -146,8 +159,7 @@ def generator_TPRLS_loss(disc_real_outputs, disc_generated_outputs):
     loss = 0
     for dg, dr in zip(disc_real_outputs, disc_generated_outputs):
         tau = 0.04
-        m_DG = torch.median((dr-dg))
-        L_rel = torch.mean((((dr - dg) - m_DG)**2)[dr < dg + m_DG])
+        L_rel = _tprls_rel(dr, dg)
         loss += tau - F.relu(tau - L_rel)
     return loss
 
@@ -195,7 +207,22 @@ class DiscriminatorLoss(torch.nn.Module):
         return d_loss.mean()
    
     
+def _as_batch_2d(x):
+    """[B, 1, T] / [B, T] / [T] -> [B, T] (never collapses the batch dim)."""
+    if x.dim() == 3:
+        x = x.squeeze(1)
+    elif x.dim() == 1:
+        x = x.unsqueeze(0)
+    return x.float()
+
+
 class WavLMLoss(torch.nn.Module):
+    """WavLM feature-matching loss and SLM discriminator wrapper.
+
+    All methods accept waveforms shaped [B, 1, T] or [B, T] (any B >= 1) and
+    run in fp32 with autocast disabled: WavLM is frozen, and its layer-norm /
+    attention statistics are not reliable in fp16/bf16.
+    """
 
     def __init__(self, model, wd, model_sr, slm_sr=16000):
         super(WavLMLoss, self).__init__()
@@ -215,60 +242,56 @@ class WavLMLoss(torch.nn.Module):
         super().train(mode)
         self.wavlm.eval()
         return self
-     
+
+    def _hidden(self, wav):
+        wav_16 = self.resample(_as_batch_2d(wav))
+        return self.wavlm(input_values=wav_16, output_hidden_states=True).hidden_states
+
+    @staticmethod
+    def _stack(hidden_states):
+        return torch.stack(hidden_states, dim=1).transpose(-1, -2).flatten(start_dim=1, end_dim=2)
+
     def forward(self, wav, y_rec):
-        with torch.no_grad():
-            wav_16 = self.resample(wav)
-            wav_embeddings = self.wavlm(input_values=wav_16, output_hidden_states=True).hidden_states
-        y_rec_16 = self.resample(y_rec)
-        # squeeze only the channel dim: a bare squeeze() also collapses the
-        # batch dim when batch_size == 1, which makes wavlm see a 1-D tensor
-        # and fail in its feature_extractor conv1d.
-        y_rec_embeddings = self.wavlm(input_values=y_rec_16.squeeze(1), output_hidden_states=True).hidden_states
+        with torch.autocast(device_type=y_rec.device.type, enabled=False):
+            with torch.no_grad():
+                wav_embeddings = self._hidden(wav)
+            y_rec_embeddings = self._hidden(y_rec)
 
-        floss = 0
-        for er, eg in zip(wav_embeddings, y_rec_embeddings):
-            floss += torch.mean(torch.abs(er - eg))
-        
+            floss = 0
+            for er, eg in zip(wav_embeddings, y_rec_embeddings):
+                floss += torch.mean(torch.abs(er - eg))
+
         return floss.mean()
-    
+
     def generator(self, y_rec):
-        y_rec_16 = self.resample(y_rec)
-        y_rec_embeddings = self.wavlm(input_values=y_rec_16, output_hidden_states=True).hidden_states
-        y_rec_embeddings = torch.stack(y_rec_embeddings, dim=1).transpose(-1, -2).flatten(start_dim=1, end_dim=2)
-        y_df_hat_g = self.wd(y_rec_embeddings)
-        loss_gen = torch.mean((1-y_df_hat_g)**2)
-        
+        with torch.autocast(device_type=y_rec.device.type, enabled=False):
+            y_rec_embeddings = self._stack(self._hidden(y_rec))
+            y_df_hat_g = self.wd(y_rec_embeddings)
+            loss_gen = torch.mean((1-y_df_hat_g)**2)
+
         return loss_gen
-    
+
     def discriminator(self, wav, y_rec):
-        with torch.no_grad():
-            wav_16 = self.resample(wav)
-            wav_embeddings = self.wavlm(input_values=wav_16, output_hidden_states=True).hidden_states
-            y_rec_16 = self.resample(y_rec)
-            y_rec_embeddings = self.wavlm(input_values=y_rec_16, output_hidden_states=True).hidden_states
+        with torch.autocast(device_type=y_rec.device.type, enabled=False):
+            with torch.no_grad():
+                y_embeddings = self._stack(self._hidden(wav))
+                y_rec_embeddings = self._stack(self._hidden(y_rec))
 
-            y_embeddings = torch.stack(wav_embeddings, dim=1).transpose(-1, -2).flatten(start_dim=1, end_dim=2)
-            y_rec_embeddings = torch.stack(y_rec_embeddings, dim=1).transpose(-1, -2).flatten(start_dim=1, end_dim=2)
+            y_df_hat_r = self.wd(y_embeddings)
+            y_df_hat_g = self.wd(y_rec_embeddings)
 
-        y_d_rs = self.wd(y_embeddings)
-        y_d_gs = self.wd(y_rec_embeddings)
-        
-        y_df_hat_r, y_df_hat_g = y_d_rs, y_d_gs
-        
-        r_loss = torch.mean((1-y_df_hat_r)**2)
-        g_loss = torch.mean((y_df_hat_g)**2)
-        
-        loss_disc_f = r_loss + g_loss
-                        
+            r_loss = torch.mean((1-y_df_hat_r)**2)
+            g_loss = torch.mean((y_df_hat_g)**2)
+
+            loss_disc_f = r_loss + g_loss
+
         return loss_disc_f.mean()
 
     def discriminator_forward(self, wav):
-        with torch.no_grad():
-            wav_16 = self.resample(wav)
-            wav_embeddings = self.wavlm(input_values=wav_16, output_hidden_states=True).hidden_states
-            y_embeddings = torch.stack(wav_embeddings, dim=1).transpose(-1, -2).flatten(start_dim=1, end_dim=2)
+        with torch.autocast(device_type=wav.device.type, enabled=False):
+            with torch.no_grad():
+                y_embeddings = self._stack(self._hidden(wav))
 
-        y_d_rs = self.wd(y_embeddings)
-        
+            y_d_rs = self.wd(y_embeddings)
+
         return y_d_rs

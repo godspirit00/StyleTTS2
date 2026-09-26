@@ -321,10 +321,9 @@ class TextEncoder(nn.Module):
             x, batch_first=True)
                 
         x = x.transpose(-1, -2)
-        x_pad = torch.zeros([x.shape[0], x.shape[1], m.shape[-1]])
-
-        x_pad[:, :, :x.shape[-1]] = x
-        x = x_pad.to(x.device)
+        # pad back to the full text length on-device (the old code built the
+        # padded tensor on the CPU, forcing a GPU->CPU->GPU round trip)
+        x = F.pad(x, (0, m.shape[-1] - x.shape[-1]))
         
         x.masked_fill_(m, 0.0)
         
@@ -483,10 +482,7 @@ class ProsodyPredictor(nn.Module):
         x, _ = nn.utils.rnn.pad_packed_sequence(
             x, batch_first=True)
         
-        x_pad = torch.zeros([x.shape[0], m.shape[-1], x.shape[-1]])
-
-        x_pad[:, :x.shape[1], :] = x
-        x = x_pad.to(x.device)
+        x = F.pad(x, (0, 0, 0, m.shape[-1] - x.shape[1]))
                 
         duration = self.duration_proj(nn.functional.dropout(x, 0.5, training=self.training))
         
@@ -561,10 +557,7 @@ class DurationEncoder(nn.Module):
                 x = F.dropout(x, p=self.dropout, training=self.training)
                 x = x.transpose(-1, -2)
                 
-                x_pad = torch.zeros([x.shape[0], x.shape[1], m.shape[-1]])
-
-                x_pad[:, :, :x.shape[-1]] = x
-                x = x_pad.to(x.device)
+                x = F.pad(x, (0, m.shape[-1] - x.shape[-1]))
         
         return x.transpose(-1, -2)
     
@@ -693,28 +686,45 @@ def build_model(args, text_aligner, pitch_extractor, bert):
     
     return nets
 
+def _unwrap(module):
+    """Return the bare module inside DataParallel / DistributedDataParallel."""
+    while hasattr(module, 'module') and isinstance(
+            module, (nn.DataParallel, nn.parallel.DistributedDataParallel)):
+        module = module.module
+    return module
+
+
+def _strip_module_prefix(state_dict):
+    """Remove any leading ``module.`` prefixes added by (D)DP wrappers."""
+    out = {}
+    for k, v in state_dict.items():
+        while k.startswith('module.'):
+            k = k[len('module.'):]
+        out[k] = v
+    return out
+
+
 def load_checkpoint(model, optimizer, path, load_only_params=True, ignore_modules=[]):
+    """Load a StyleTTS2 checkpoint into ``model`` (a dict of modules).
+
+    Checkpoints saved from DataParallel / DDP-wrapped modules carry a
+    ``module.`` prefix while ones saved from bare modules do not; loading
+    either kind into either kind of wrapper used to silently load *nothing*
+    (yl4579/StyleTTS2#254 -- NaN loss from step 0 in the second stage on a
+    single GPU).  Keys are normalised on both sides here and the load is
+    loud: any shape mismatch raises, and a module that loads zero tensors
+    raises too.
+    """
     state = torch.load(path, map_location='cpu', weights_only=False)
     params = state['net']
 
     for key in model:
         if key not in params or key in ignore_modules:
             continue
-        try:
-            model[key].load_state_dict(params[key], strict=True)
-            print('%s loaded' % key)
-            continue
-        except RuntimeError:
-            pass
+        target = _unwrap(model[key])
+        model_sd = target.state_dict()
+        ckpt_sd = _strip_module_prefix(params[key])
 
-        # Strict load failed: do a safe, name- and shape-matched partial load.
-        # Copy every parameter whose name AND shape match the checkpoint; record
-        # the rest.  This intentionally does NOT fall back to copying tensors by
-        # position (the previous behaviour), because a positional copy silently
-        # loads unrelated weights into the wrong parameters whenever the two
-        # state dicts happen to share a shape — corrupting the model.
-        model_sd = model[key].state_dict()
-        ckpt_sd = params[key]
         matched, shape_mismatch, missing = {}, [], []
         for name, tgt in model_sd.items():
             if name not in ckpt_sd:
@@ -726,9 +736,8 @@ def load_checkpoint(model, optimizer, path, load_only_params=True, ignore_module
             else:
                 matched[name] = ckpt_sd[name]
 
-        # Shape mismatches mean the architectures genuinely differ — most often
-        # because the decoder config does not match the checkpoint.  Loading
-        # would be meaningless, so stop with an actionable message.
+        # Shape mismatches mean the architectures genuinely differ -- most
+        # often because the decoder config does not match the checkpoint.
         if shape_mismatch:
             hint = ''
             if key == 'decoder':
@@ -749,9 +758,19 @@ def load_checkpoint(model, optimizer, path, load_only_params=True, ignore_module
                 "shapes and cannot be loaded:\n  %s%s%s"
                 % (len(shape_mismatch), key, preview, more, hint))
 
-        model[key].load_state_dict(matched, strict=False)
-        print('%s partially loaded: %d/%d tensors (%d missing in checkpoint)'
-              % (key, len(matched), len(model_sd), len(missing)))
+        if model_sd and not matched:
+            raise RuntimeError(
+                "load_checkpoint: none of the %d tensors of module '%s' were "
+                "found in %s (checkpoint keys look like %s). The checkpoint "
+                "does not belong to this model architecture."
+                % (len(model_sd), key, path, list(ckpt_sd.keys())[:3]))
+
+        target.load_state_dict(matched, strict=False)
+        if missing:
+            print('%s partially loaded: %d/%d tensors (%d missing in checkpoint)'
+                  % (key, len(matched), len(model_sd), len(missing)))
+        else:
+            print('%s loaded' % key)
 
     if not load_only_params:
         epoch = state["epoch"]
