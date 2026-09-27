@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
 from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
-from .utils import init_weights, get_padding
+from .utils import init_weights, get_padding, maybe_checkpoint
 
 import math
 import random
@@ -88,18 +88,22 @@ class TorchSTFT(torch.nn.Module):
         self.win_length = win_length
         self.window = torch.from_numpy(get_window(window, win_length, fftbins=True).astype(np.float32))
 
+    # (i)STFT always runs in fp32: cuFFT has no bf16 kernels and fp16 is
+    # limited to power-of-two sizes, so it must be kept out of autocast.
     def transform(self, input_data):
-        forward_transform = torch.stft(
-            input_data,
-            self.filter_length, self.hop_length, self.win_length, window=self.window.to(input_data.device),
-            return_complex=True)
+        with torch.autocast(device_type=input_data.device.type, enabled=False):
+            forward_transform = torch.stft(
+                input_data.float(),
+                self.filter_length, self.hop_length, self.win_length, window=self.window.to(input_data.device),
+                return_complex=True)
 
         return torch.abs(forward_transform), torch.angle(forward_transform)
 
     def inverse(self, magnitude, phase):
-        inverse_transform = torch.istft(
-            magnitude * torch.exp(phase * 1j),
-            self.filter_length, self.hop_length, self.win_length, window=self.window.to(magnitude.device))
+        with torch.autocast(device_type=magnitude.device.type, enabled=False):
+            inverse_transform = torch.istft(
+                magnitude.float() * torch.exp(phase.float() * 1j),
+                self.filter_length, self.hop_length, self.win_length, window=self.window.to(magnitude.device))
 
         return inverse_transform.unsqueeze(-2)  # unsqueeze to stay consistent with conv_transpose1d implementation
 
@@ -359,7 +363,7 @@ class Generator(torch.nn.Module):
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, LRELU_SLOPE)
             x_source = self.noise_convs[i](har)
-            x_source = self.noise_res[i](x_source, s)
+            x_source = maybe_checkpoint('decoder', self.noise_res[i], x_source, s)
 
             x = self.ups[i](x)
             if i == self.num_upsamples - 1:
@@ -369,9 +373,9 @@ class Generator(torch.nn.Module):
             xs = None
             for j in range(self.num_kernels):
                 if xs is None:
-                    xs = self.resblocks[i*self.num_kernels+j](x, s)
+                    xs = maybe_checkpoint('decoder', self.resblocks[i*self.num_kernels+j], x, s)
                 else:
-                    xs += self.resblocks[i*self.num_kernels+j](x, s)
+                    xs = xs + maybe_checkpoint('decoder', self.resblocks[i*self.num_kernels+j], x, s)
             x = xs / self.num_kernels
         x = F.leaky_relu(x)
         x = self.conv_post(x)
@@ -386,9 +390,9 @@ class Generator(torch.nn.Module):
             xs = None
             for j in range(self.num_kernels):
                 if xs is None:
-                    xs = self.resblocks[i*self.num_kernels+j](x, s)
+                    xs = maybe_checkpoint('decoder', self.resblocks[i*self.num_kernels+j], x, s)
                 else:
-                    xs += self.resblocks[i*self.num_kernels+j](x, s)
+                    xs = xs + maybe_checkpoint('decoder', self.resblocks[i*self.num_kernels+j], x, s)
             x = xs / self.num_kernels
         x = F.leaky_relu(x)
         x = self.reflection_pad(x)
@@ -503,9 +507,9 @@ class Decoder(nn.Module):
             downlist = [0, 3, 7, 15]
             N_down = downlist[random.randint(0, 3)]
             if F0_down:
-                F0_curve = nn.functional.conv1d(F0_curve.unsqueeze(1), torch.ones(1, 1, F0_down).to('cuda'), padding=F0_down//2).squeeze(1) / F0_down
+                F0_curve = nn.functional.conv1d(F0_curve.unsqueeze(1), torch.ones(1, 1, F0_down, device=F0_curve.device, dtype=F0_curve.dtype), padding=F0_down//2).squeeze(1) / F0_down
             if N_down:
-                N = nn.functional.conv1d(N.unsqueeze(1), torch.ones(1, 1, N_down).to('cuda'), padding=N_down//2).squeeze(1)  / N_down
+                N = nn.functional.conv1d(N.unsqueeze(1), torch.ones(1, 1, N_down, device=N.device, dtype=N.dtype), padding=N_down//2).squeeze(1)  / N_down
 
         
         F0 = self.F0_conv(F0_curve.unsqueeze(1))
