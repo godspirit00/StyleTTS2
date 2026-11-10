@@ -19,11 +19,11 @@ def stft(x, fft_size, hop_size, win_length, window):
     Returns:
         Tensor: Magnitude spectrogram (B, #frames, fft_size // 2 + 1).
     """
-    x_stft = torch.stft(x, fft_size, hop_size, win_length, window,
-            return_complex=True)
-    real = x_stft[..., 0]
-    imag = x_stft[..., 1]
-
+    # cuFFT has no bf16 path (and fp16 only for power-of-two sizes): always
+    # run the STFT in fp32, even under autocast.
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        x_stft = torch.stft(x.float(), fft_size, hop_size, win_length, window.float(),
+                return_complex=True)
     return torch.abs(x_stft).transpose(2, 1)
 
 class SpecDiscriminator(nn.Module):
@@ -50,7 +50,7 @@ class SpecDiscriminator(nn.Module):
 
         fmap = []
         y = y.squeeze(1)
-        y = stft(y, self.fft_size, self.shift_size, self.win_length, self.window.to(y.get_device()))
+        y = stft(y, self.fft_size, self.shift_size, self.win_length, self.window.to(y.device))
         y = y.unsqueeze(1)
         for i, d in enumerate(self.discriminators):
             y = d(y)

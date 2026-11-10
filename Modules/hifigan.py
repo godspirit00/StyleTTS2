@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
 from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
-from .utils import init_weights, get_padding
+from .utils import init_weights, get_padding, maybe_checkpoint
 
 import math
 import random
@@ -328,7 +328,7 @@ class Generator(torch.nn.Module):
         for i in range(self.num_upsamples):
             x = x + (1 / self.alphas[i]) * (torch.sin(self.alphas[i] * x) ** 2)
             x_source = self.noise_convs[i](har_source)
-            x_source = self.noise_res[i](x_source, s)
+            x_source = maybe_checkpoint('decoder', self.noise_res[i], x_source, s)
             
             x = self.ups[i](x)
             x = x + x_source
@@ -336,9 +336,9 @@ class Generator(torch.nn.Module):
             xs = None
             for j in range(self.num_kernels):
                 if xs is None:
-                    xs = self.resblocks[i*self.num_kernels+j](x, s)
+                    xs = maybe_checkpoint('decoder', self.resblocks[i*self.num_kernels+j], x, s)
                 else:
-                    xs += self.resblocks[i*self.num_kernels+j](x, s)
+                    xs = xs + maybe_checkpoint('decoder', self.resblocks[i*self.num_kernels+j], x, s)
             x = xs / self.num_kernels
         x = x + (1 / self.alphas[i+1]) * (torch.sin(self.alphas[i+1] * x) ** 2)
         x = self.conv_post(x)
@@ -450,9 +450,9 @@ class Decoder(nn.Module):
             downlist = [0, 3, 7, 15]
             N_down = downlist[random.randint(0, 3)]
             if F0_down:
-                F0_curve = nn.functional.conv1d(F0_curve.unsqueeze(1), torch.ones(1, 1, F0_down).to('cuda'), padding=F0_down//2).squeeze(1) / F0_down
+                F0_curve = nn.functional.conv1d(F0_curve.unsqueeze(1), torch.ones(1, 1, F0_down, device=F0_curve.device, dtype=F0_curve.dtype), padding=F0_down//2).squeeze(1) / F0_down
             if N_down:
-                N = nn.functional.conv1d(N.unsqueeze(1), torch.ones(1, 1, N_down).to('cuda'), padding=N_down//2).squeeze(1)  / N_down
+                N = nn.functional.conv1d(N.unsqueeze(1), torch.ones(1, 1, N_down, device=N.device, dtype=N.dtype), padding=N_down//2).squeeze(1)  / N_down
 
         
         F0 = self.F0_conv(F0_curve.unsqueeze(1))

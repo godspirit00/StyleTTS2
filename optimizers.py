@@ -47,7 +47,7 @@ class MultiOptimizer:
         self.optimizers = optimizers
         self.schedulers = schedulers
         self.keys = list(optimizers.keys())
-        self.param_groups = reduce(lambda x,y: x+y, [v.param_groups for v in self.optimizers.values()])
+        self.param_groups = reduce(lambda x,y: x+y, [v.param_groups for v in self.optimizers.values()], [])
 
     def state_dict(self):
         state_dicts = [(key, self.optimizers[key].state_dict())\
@@ -79,71 +79,47 @@ class MultiOptimizer:
             _ = [self.optimizers[key].zero_grad() for key in self.keys]
 
     def scheduler(self, *args, key=None):
-        keys = [key] if key is not None else self.keys
-        for k in keys:
-            try:
-                self.schedulers[k].step(*args)
-            except ValueError:
-                # OneCycleLR raises once it is stepped past its total_steps.
-                # With dynamic batching the real number of steps per epoch can
-                # exceed the estimate made at build time (batch sizes shrink
-                # after OOMs), so hold the final LR instead of crashing.
-                pass
+        """Kept for backwards compatibility; LR schedules live in
+        train_common.ProgressLR."""
+        pass
 
-def define_scheduler(optimizer, params):
-    steps_per_epoch = params.get('steps_per_epoch', 1000)
-    if steps_per_epoch < 1:
-        raise ValueError(
-            'steps_per_epoch is %r, i.e. the training dataloader is empty. '
-            'With dynamic_batch this usually means every sample was binned as '
-            'too short: check the FilePathDataset warnings above for files '
-            'whose length could not be read, and verify data_params.root_path '
-            'and the paths in your train list.' % steps_per_epoch)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=params.get('max_lr', 2e-4),
-        epochs=params.get('epochs', 200),
-        steps_per_epoch=params.get('steps_per_epoch', 1000),
-        pct_start=params.get('pct_start', 0.0),
-        div_factor=params.get('div_factor', 1),
-        final_div_factor=params.get('final_div_factor', 1))
+# In the original code every optimizer got a OneCycleLR scheduler that was
+# never stepped.  Its constructor nevertheless overwrote AdamW's beta1 (0.0)
+# with its momentum-cycle start value (~0.85), so the published models were
+# trained with betas=(0.85, 0.99) for every module whose betas were not reset
+# afterwards.  The schedulers are gone (see train_common.ProgressLR for a
+# schedule that works with dynamic batching) but that effective beta1 is kept.
+DEFAULT_BETAS = (0.85, 0.99)
 
-    return scheduler
 
-def build_optimizer(parameters_dict, scheduler_params_dict, lr,
+def build_optimizer(parameters_dict, scheduler_params_dict=None, lr=1e-4,
                     use_8bit=False, fused=True):
     """Build the per-module AdamW optimizers used by StyleTTS2.
 
-    Modules whose parameters are all frozen (``requires_grad=False``) get a
+    ``scheduler_params_dict[key]['max_lr']`` (if given) is the initial LR of
+    module ``key`` (this is what the original, never-stepped OneCycleLR with
+    div_factor=1 amounted to).  Modules whose parameters are all frozen get a
     no-op optimizer instead of one allocating Adam state for unused params.
 
     Args:
-        use_8bit: if True, use bitsandbytes.optim.AdamW8bit when available
-            (~4x smaller optimizer state).  Falls back to standard AdamW.
-        fused:   if True, use the fused-AdamW CUDA kernel when available
-            (a small speedup).  Falls back to non-fused on older PyTorch.
+        use_8bit: use bitsandbytes.optim.AdamW8bit when available (~4x smaller
+            optimizer state).  Falls back to standard AdamW.
+        fused:   use the fused-AdamW CUDA kernel when available.
     """
+    scheduler_params_dict = scheduler_params_dict or {}
     optim = {}
     for key, params in parameters_dict.items():
         params = [p for p in params if p.requires_grad]
         if len(params) == 0:
-            # Frozen module: provide a no-op optimizer so step()/zero_grad()
-            # still work without allocating Adam state for unused tensors.
             optim[key] = _NoOpOptimizer()
         else:
+            key_lr = float(scheduler_params_dict.get(key, {}).get('max_lr', lr))
             optim[key] = _build_adamw(
-                params, lr=lr, use_8bit=use_8bit, fused=fused,
-                weight_decay=1e-4, betas=(0.0, 0.99), eps=1e-9,
+                params, lr=key_lr, use_8bit=use_8bit, fused=fused,
+                weight_decay=1e-4, betas=DEFAULT_BETAS, eps=1e-9,
             )
 
-    schedulers = {}
-    for key, opt in optim.items():
-        if isinstance(opt, _NoOpOptimizer):
-            schedulers[key] = _NoOpScheduler()
-        else:
-            schedulers[key] = define_scheduler(opt, scheduler_params_dict[key])
-
-    return MultiOptimizer(optim, schedulers)
+    return MultiOptimizer(optim, {})
 
 
 class _NoOpOptimizer:

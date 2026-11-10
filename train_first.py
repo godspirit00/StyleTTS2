@@ -1,43 +1,41 @@
 import os
 import os.path as osp
-import re
-import sys
-import yaml
 import shutil
-import numpy as np
-import torch
-import click
+import time
+import random
+import logging
 import warnings
 warnings.simplefilter('ignore')
 
-# load packages
-import random
 import yaml
-from munch import Munch
+import click
 import numpy as np
 import torch
-from torch import nn
 import torch.nn.functional as F
-import torchaudio
-import librosa
+from munch import Munch
 
 from models import *
 from meldataset import build_dataloader, get_bin_from_mel_input_length
 from utils import *
+from utils import enable_gradient_checkpointing, configure_cuda_allocator
 from losses import *
 from optimizers import build_optimizer
-from utils import enable_diffusion_gradient_checkpointing, configure_cuda_allocator
-import time
+from train_common import (Amp, ProgressLR, setup_speed_flags, is_oom, free_memory,
+                          select_segments, s2s_loss, all_finite, resolve_precision,
+                          phase_scale)
 
 from accelerate import Accelerator
-from accelerate.utils import LoggerType
 from accelerate import DistributedDataParallelKwargs
-
+from accelerate.logging import get_logger
 from torch.utils.tensorboard import SummaryWriter
 
-import logging
-from accelerate.logging import get_logger
 logger = get_logger(__name__, log_level="DEBUG")
+
+# Modules the first stage never calls: they are neither wrapped in DDP nor
+# given optimizer state.
+_UNUSED_IN_FIRST_STAGE = ('bert', 'bert_encoder', 'predictor', 'predictor_encoder',
+                          'diffusion', 'wd')
+
 
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config.yml', type=str)
@@ -46,19 +44,19 @@ def main(config_path):
 
     log_dir = config['log_dir']
     if not osp.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
-    shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
+    if config.get('cuda_expandable_segments', True):
+        configure_cuda_allocator(expandable_segments=True)
+
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    # Accelerate handles AMP itself; "no" / "fp16" / "bf16" all valid.
-    mixed_precision = config.get('mixed_precision', 'no')
-    if isinstance(mixed_precision, bool):
-        mixed_precision = 'no' if not mixed_precision else 'fp16'
-    accelerator = Accelerator(
-        project_dir=log_dir,
-        split_batches=True,
-        mixed_precision=mixed_precision,
-        kwargs_handlers=[ddp_kwargs],
-    )
-    if accelerator.is_main_process:
+    # Mixed precision is handled by train_common.Amp (one GradScaler that is
+    # correct for the several optimizers stepped per iteration), not by
+    # Accelerate, which is used for device placement / DDP only.
+    accelerator = Accelerator(project_dir=log_dir, split_batches=True,
+                              mixed_precision='no', kwargs_handlers=[ddp_kwargs])
+    is_main = accelerator.is_main_process
+    world = accelerator.num_processes
+    if is_main:
+        shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
         writer = SummaryWriter(log_dir + "/tensorboard")
 
     # write logs
@@ -66,15 +64,16 @@ def main(config_path):
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
     logger.logger.addHandler(file_handler)
-    
+    logging.getLogger('meldataset').addHandler(file_handler)
+
     batch_size = config.get('batch_size', 10)
     device = accelerator.device
-    
+    setup_speed_flags(config)
+
     epochs = config.get('epochs_1st', 200)
-    save_freq = config.get('save_freq', 2)
     log_interval = config.get('log_interval', 10)
     saving_epoch = config.get('save_freq', 2)
-    
+
     data_params = config.get('data_params', None)
     sr = config['preprocess_params'].get('sr', 24000)
     train_path = data_params['train_data']
@@ -82,24 +81,22 @@ def main(config_path):
     root_path = data_params['root_path']
     min_length = data_params['min_length']
     OOD_data = data_params['OOD_data']
-    
-    max_len = config.get('max_len', 200)
-    dynamic_batch = config.get('dynamic_batch', False)
-    # Frame budget per batch: a bin of padded length L gets batch size
-    # max_batch_frames // L, so short bins get large batches and long bins
-    # small ones.  Defaults to batch_size * max_len, which matches the peak
-    # per-batch frame count of the non-dynamic code path.
-    max_batch_frames = int(config.get('max_batch_frames') or (batch_size * max_len))
-    batch_size_file = osp.join(log_dir, 'batch_sizes.json')
 
-    # Optional speed/memory knobs (defaults preserve old behaviour).
+    max_len = config.get('max_len', 200)
+    dynamic_batch = config.get('dynamic_batch', True)
+    # Frame budget per batch (bin of padded length L -> batch size budget // L).
+    max_batch_frames = int(config.get('max_batch_frames') or (batch_size * max_len))
+    # With dynamic batching whole utterances are used; optionally cap them.
+    seg_cap = config.get('max_segment_len', None) if dynamic_batch else max_len
+    batch_size_file = osp.join(log_dir, 'batch_sizes_1st.json')
+
     num_workers = int(config.get('num_workers', 2))
-    grad_checkpoint = config.get('gradient_checkpointing', False)
-    use_8bit_optim = config.get('use_8bit_optimizer', False)
     disc_update_freq = max(1, int(config.get('disc_update_freq', 1)))
-    if config.get('cuda_expandable_segments', True):
-        configure_cuda_allocator(expandable_segments=True)
-    enable_diffusion_gradient_checkpointing(grad_checkpoint)
+    enable_gradient_checkpointing(config.get('gradient_checkpointing', False))
+    amp = Amp(resolve_precision(config), device=str(device), clip_norm=config.get('grad_clip_norm', None))
+
+    model_params = recursive_munch(config['model_params'])
+    multispeaker = model_params.multispeaker
 
     # load data
     train_list, val_list = get_data_path_list(train_path, val_path)
@@ -110,27 +107,27 @@ def main(config_path):
                                         min_length=min_length,
                                         batch_size=batch_size,
                                         num_workers=num_workers,
-                                        dataset_config={},
+                                        dataset_config={'multispeaker': multispeaker},
                                         device=device,
                                         dynamic_batch=dynamic_batch,
                                         batch_size_file=batch_size_file,
-                                        max_batch_frames=max_batch_frames)
-
-    # Keep a reference to the BatchManager before accelerator.prepare wraps
-    # the dataloader in a DataLoaderShard, which does not preserve the custom
-    # batch_manager attribute set in build_dataloader.
+                                        max_batch_frames=max_batch_frames,
+                                        max_batch_size=int(config.get('max_batch_size', 64)),
+                                        num_replicas=world if dynamic_batch else 1,
+                                        rank=accelerator.process_index if dynamic_batch else 0)
     batch_manager = train_dataloader.batch_manager
 
+    # Validation: batch size 1, whole utterances -> deterministic, no cropping.
     val_dataloader = build_dataloader(val_list,
                                       root_path,
                                       OOD_data=OOD_data,
                                       min_length=min_length,
-                                      batch_size=batch_size,
+                                      batch_size=1,
                                       validation=True,
                                       num_workers=0,
                                       device=device,
-                                      dataset_config={})
-    
+                                      dataset_config={'multispeaker': False})
+
     with accelerator.main_process_first():
         # load pretrained ASR model
         ASR_config = config.get('ASR_config', False)
@@ -146,103 +143,95 @@ def main(config_path):
         BERT_path = config.get('PLBERT_dir', False)
         plbert = load_plbert(BERT_path)
 
-    scheduler_params = {
-        "max_lr": float(config['optimizer_params'].get('lr', 1e-4)),
-        "pct_start": float(config['optimizer_params'].get('pct_start', 0.0)),
-        "epochs": epochs,
-        "steps_per_epoch": len(train_dataloader),
-    }
-    
-    model_params = recursive_munch(config['model_params'])
-    multispeaker = model_params.multispeaker
     model = build_model(model_params, text_aligner, pitch_extractor, plbert)
 
-    best_loss = float('inf')  # best test loss
-    loss_train_record = list([])
-    loss_test_record = list([])
+    # The pitch extractor is only ever run under no_grad here (the original
+    # "stepped" it after TMA_epoch, a no-op without gradients): freeze it.
+    for p in model.pitch_extractor.parameters():
+        p.requires_grad = False
+    for key in _UNUSED_IN_FIRST_STAGE:
+        for p in model[key].parameters():
+            p.requires_grad = False
+
+    best_loss = float('inf')
 
     loss_params = Munch(config['loss_params'])
     TMA_epoch = loss_params.TMA_epoch
-    
+
     for k in model:
-        model[k] = accelerator.prepare(model[k])
-    
-    # Save batch_manager before accelerator.prepare() wraps the DataLoader,
-    # since the wrapper may not forward custom attributes.
-    batch_manager = train_dataloader.batch_manager
+        if any(p.requires_grad for p in model[k].parameters()):
+            model[k] = accelerator.prepare(model[k])
+        else:
+            model[k] = model[k].to(device)
 
-    train_dataloader, val_dataloader = accelerator.prepare(
-        train_dataloader, val_dataloader
-    )
-    
-    _ = [model[key].to(device) for key in model]
+    if not dynamic_batch:
+        # Legacy random batches: let Accelerate shard them (global batch_size).
+        train_dataloader = accelerator.prepare(train_dataloader)
 
-    # initialize optimizers after preparing models for compatibility with FSDP
     optimizer = build_optimizer({key: model[key].parameters() for key in model},
-                                  scheduler_params_dict= {key: scheduler_params.copy() for key in model},
-                               lr=float(config['optimizer_params'].get('lr', 1e-4)),
-                               use_8bit=use_8bit_optim)
-    
-    for k, v in optimizer.optimizers.items():
-        optimizer.optimizers[k] = accelerator.prepare(optimizer.optimizers[k])
-        optimizer.schedulers[k] = accelerator.prepare(optimizer.schedulers[k])
-    
+                                scheduler_params_dict={key: {} for key in model},
+                                lr=float(config['optimizer_params'].get('lr', 1e-4)),
+                                use_8bit=config.get('use_8bit_optimizer', False))
+    lr_sched = ProgressLR(optimizer, epochs, kind=config.get('lr_schedule', 'constant'))
+
+    start_epoch, iters = 0, 0
     with accelerator.main_process_first():
         if config.get('pretrained_model', '') != '':
-            model, optimizer, start_epoch, iters = load_checkpoint(model,  optimizer, config['pretrained_model'],
-                                        load_only_params=config.get('load_only_params', True))
-        else:
-            start_epoch = 0
-            iters = 0
-    
-    # in case not distributed
-    try:
-        n_down = model.text_aligner.module.n_down
-    except:
-        n_down = model.text_aligner.n_down
-    
-    # wrapped losses for compatibility with mixed precision
+            load_only = config.get('load_only_params', True)
+            model, optimizer, start_epoch, iters = load_checkpoint(
+                model, optimizer, config['pretrained_model'], load_only_params=load_only)
+            if not load_only:
+                start_epoch += 1  # the saved epoch was completed
+                amp.load_state_dict(torch.load(config['pretrained_model'], map_location='cpu',
+                                               weights_only=False).get('amp_scaler'))
+
+    raw = Munch({k: accelerator.unwrap_model(model[k]) for k in model})
+    n_down = raw.text_aligner.n_down
+
     stft_loss = MultiResolutionSTFTLoss().to(device)
     gl = GeneratorLoss(model.mpd, model.msd).to(device)
     dl = DiscriminatorLoss(model.mpd, model.msd).to(device)
-    wl = WavLMLoss(model_params.slm.model, 
-                   model.wd, 
-                   sr, 
+    wl = WavLMLoss(model_params.slm.model,
+                   model.wd,
+                   sr,
                    model_params.slm.sr).to(device)
 
+    loss_test = float('nan')
     for epoch in range(start_epoch, epochs):
         running_loss = 0
+        n_running = 0
         start_time = time.time()
+        tma = epoch >= TMA_epoch
 
         _ = [model[key].train() for key in model]
+        model.pitch_extractor.eval()
 
+        if batch_manager is not None:
+            # Memory grows when the aligner/discriminators join (TMA); learned
+            # sizes are kept per phase.
+            phase = 'first_tma' if tma else 'first'
+            batch_manager.set_phase(phase, scale=phase_scale(config, phase))
         if epoch == TMA_epoch:
-            log_print('Epoch %d: text aligner and pitch extractor joining training — VRAM usage will increase' % epoch, logger)
-            if dynamic_batch and batch_manager is not None:
-                batch_manager.scale_all(0.5)
-                log_print('Epoch %d: batch sizes halved proactively for TMA transition' % epoch, logger)
+            log_print('Epoch %d: TMA starts (text aligner + discriminators join training)' % epoch, logger)
 
+        steps_in_epoch = max(1, len(train_dataloader))
+        n_skipped = 0
         for i, batch in enumerate(train_dataloader):
-            # Pre-declare every variable the iter body assigns, so the
-            # OOM-cleanup `del` below sees them defined regardless of where
-            # the exception fired.
-            waves = texts = input_lengths = mels = mel_input_length = None
-            mask = text_mask = attn_mask = None
-            ppgs = s2s_pred = s2s_attn = mask_ST = s2s_attn_mono = None
-            t_en = asr = mel_input_length_all = None
-            en = gt = wav = st = real_norm = F0_real = s = y_rec = None
-            d_loss = loss_mel = loss_s2s = loss_mono = None
-            loss_gen_all = loss_slm = g_loss = None
+            lr_sched.set_progress(epoch + min(i / steps_in_epoch, 1.0))
+            mel_input_length = None
             try:
                 waves = batch[0]
-                batch = [b.to(device) for b in batch[1:]]
+                batch = [b.to(device, non_blocking=True) for b in batch[1:]]
                 texts, input_lengths, _, _, mels, mel_input_length, _ = batch
+                bs = mels.shape[0]
 
                 with torch.no_grad():
-                    mask = length_to_mask(mel_input_length // (2 ** n_down)).to('cuda')
-                    text_mask = length_to_mask(input_lengths).to(texts.device)
+                    mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
+                    text_mask = length_to_mask(input_lengths).to(device)
 
-                ppgs, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
+                # Before TMA the aligner is not trained: run it without a graph.
+                with torch.set_grad_enabled(tma), amp.autocast():
+                    ppgs, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
 
                 s2s_attn = s2s_attn.transpose(-1, -2)
                 s2s_attn = s2s_attn[..., 1:]
@@ -253,106 +242,63 @@ def main(config_path):
                     attn_mask = attn_mask.float() * (~text_mask).unsqueeze(-1).expand(text_mask.shape[0], text_mask.shape[1], mask.shape[-1]).float()
                     attn_mask = (attn_mask < 1)
 
-                s2s_attn.masked_fill_(attn_mask, 0.0)
+                s2s_attn = s2s_attn.masked_fill(attn_mask, 0.0)
 
-                # maximum_path / mask_from_lens go through .numpy(); bf16 tensors
-                # cannot be converted, so disable autocast and cast to fp32.
-                with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
+                with torch.no_grad():
                     mask_ST = mask_from_lens(s2s_attn.float(), input_lengths, mel_input_length // (2 ** n_down))
                     s2s_attn_mono = maximum_path(s2s_attn.float(), mask_ST)
 
-                # encode
-                t_en = model.text_encoder(texts, input_lengths, text_mask)
+                with amp.autocast():
+                    t_en = model.text_encoder(texts, input_lengths, text_mask)
+                    # 50% of chance of using monotonic version
+                    if bool(random.getrandbits(1)):
+                        asr = (t_en @ s2s_attn.to(t_en.dtype))
+                    else:
+                        asr = (t_en @ s2s_attn_mono.to(t_en.dtype))
 
-                # 50% of chance of using monotonic version
-                if bool(random.getrandbits(1)):
-                    asr = (t_en @ s2s_attn)
-                else:
-                    asr = (t_en @ s2s_attn_mono)
-
-                # get clips
-                # With dynamic batching all mel_input_length values are equal, so
-                # mel_len == mel_input_length[0]/2 - 1 and random_start is always 0,
-                # meaning the full sample is used without cross-sample clipping.
-                mel_input_length_all = accelerator.gather(mel_input_length) # for balanced load
-                mel_len = min([int(mel_input_length_all.min().item() / 2 - 1), max_len // 2])
-                mel_len_st = int(mel_input_length.min().item() / 2 - 1)
-
-                en = []
-                gt = []
-                wav = []
-                st = []
-
-                for bib in range(len(mel_input_length)):
-                    mel_length = int(mel_input_length[bib].item() / 2)
-
-                    random_start = np.random.randint(0, mel_length - mel_len)
-                    en.append(asr[bib, :, random_start:random_start+mel_len])
-                    gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
-
-                    y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
-                    wav.append(torch.from_numpy(y).to(device))
-
-                    # style reference (better to be different from the GT)
-                    random_start = np.random.randint(0, mel_length - mel_len_st)
-                    st.append(mels[bib, :, (random_start * 2):((random_start+mel_len_st) * 2)])
-
-                en = torch.stack(en)
-                gt = torch.stack(gt).detach()
-                st = torch.stack(st).detach()
-
-                wav = torch.stack(wav).float().detach()
+                en, gt, wav, st, _ = select_segments(
+                    asr, mels, waves, mel_input_length, seg_cap, device,
+                    full_length=dynamic_batch, st_mode='random' if multispeaker else 'same')
 
                 # clip too short to be used by the style encoder
                 if gt.shape[-1] < 80:
                     continue
 
-                with torch.no_grad():
+                with torch.no_grad(), amp.autocast():
                     real_norm = log_norm(gt.unsqueeze(1)).squeeze(1).detach()
                     F0_real, _, _ = model.pitch_extractor(gt.unsqueeze(1))
 
-                s = model.style_encoder(st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
-
-                y_rec = model.decoder(en, F0_real, real_norm, s)
+                with amp.autocast():
+                    s = model.style_encoder(st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
+                    y_rec = model.decoder(en, F0_real, real_norm, s)
 
                 # discriminator loss
-
-                do_disc_step = (epoch >= TMA_epoch) and ((iters % disc_update_freq) == 0)
-                if do_disc_step:
+                if tma and (iters % disc_update_freq) == 0:
                     optimizer.zero_grad()
-                    d_loss = dl(wav.detach().unsqueeze(1).float(), y_rec.detach()).mean()
-                    accelerator.backward(d_loss)
-                    optimizer.step('msd')
-                    optimizer.step('mpd')
+                    with amp.autocast():
+                        d_loss = dl(wav.detach().unsqueeze(1).float(), y_rec.detach()).mean()
+                    amp.backward(d_loss)
+                    amp.step(optimizer, ['msd', 'mpd'])
+                    amp.update()
                 else:
                     d_loss = 0
 
                 # generator loss
                 optimizer.zero_grad()
-                # squeeze only the channel dim: a bare squeeze() also collapses
-                # the batch dim when batch_size == 1, which makes the STFT loss
-                # see a 1-D tensor and crash inside cuFFT (CUFFT_INTERNAL_ERROR).
-                loss_mel = stft_loss(y_rec.squeeze(1), wav.detach())
+                loss_mel = stft_loss(y_rec, wav)
 
-                if epoch >= TMA_epoch: # start TMA training
-                    loss_s2s = 0
-                    for _s2s_pred, _text_input, _text_length in zip(s2s_pred, texts, input_lengths):
-                        loss_s2s += F.cross_entropy(_s2s_pred[:_text_length], _text_input[:_text_length])
-                    loss_s2s /= texts.size(0)
-
-                    loss_mono = F.l1_loss(s2s_attn, s2s_attn_mono) * 10
-
-                    loss_gen_all = gl(wav.detach().unsqueeze(1).float(), y_rec).mean()
-                    # WavLM is frozen+eval; keep it in fp32 under AMP for stability.
-                    with torch.cuda.amp.autocast(enabled=False):
-                        loss_slm = wl(wav.detach().float(), y_rec.float()).mean()
+                if tma:  # start TMA training
+                    loss_s2s = s2s_loss(s2s_pred, texts, input_lengths)
+                    loss_mono = F.l1_loss(s2s_attn.float(), s2s_attn_mono) * 10
+                    with amp.autocast():
+                        loss_gen_all = gl(wav.detach().unsqueeze(1).float(), y_rec).mean()
+                    loss_slm = wl(wav.detach(), y_rec).mean()
 
                     g_loss = loss_params.lambda_mel * loss_mel + \
-                    loss_params.lambda_mono * loss_mono + \
-                    loss_params.lambda_s2s * loss_s2s + \
-                    loss_params.lambda_gen * loss_gen_all + \
-                    loss_params.lambda_slm * loss_slm
-
+                        loss_params.lambda_mono * loss_mono + \
+                        loss_params.lambda_s2s * loss_s2s + \
+                        loss_params.lambda_gen * loss_gen_all + \
+                        loss_params.lambda_slm * loss_slm
                 else:
                     loss_s2s = 0
                     loss_mono = 0
@@ -360,25 +306,30 @@ def main(config_path):
                     loss_slm = 0
                     g_loss = loss_mel
 
-                running_loss += accelerator.gather(loss_mel).mean().item()
+                if not all_finite(g_loss):
+                    # Still run backward so DDP ranks stay in lock-step; Amp
+                    # refuses to apply the non-finite gradients.
+                    n_skipped += 1
+                amp.backward(g_loss)
+                keys = ['text_encoder', 'style_encoder', 'decoder']
+                if tma:
+                    keys.append('text_aligner')
+                amp.step(optimizer, keys)
+                amp.update()
 
-                accelerator.backward(g_loss)
-
-                optimizer.step('text_encoder')
-                optimizer.step('style_encoder')
-                optimizer.step('decoder')
-
-                if epoch >= TMA_epoch:
-                    optimizer.step('text_aligner')
-                    optimizer.step('pitch_extractor')
-
+                if all_finite(loss_mel):
+                    running_loss += loss_mel.item()
+                    n_running += 1
                 iters = iters + 1
+                if batch_manager is not None:
+                    batch_manager.on_success(get_bin_from_mel_input_length(mel_input_length), bs)
 
-                if (i+1)%log_interval == 0 and accelerator.is_main_process:
-                    log_print ('Epoch [%d/%d], Step [%d/%d], Mel Loss: %.5f, Gen Loss: %.5f, Disc Loss: %.5f, Mono Loss: %.5f, S2S Loss: %.5f, SLM Loss: %.5f'
-                            %(epoch+1, epochs, i+1, len(train_dataloader), running_loss / log_interval, loss_gen_all, d_loss, loss_mono, loss_s2s, loss_slm), logger)
+                if (i+1) % log_interval == 0 and is_main:
+                    mel_avg = running_loss / max(1, n_running)
+                    log_print('Epoch [%d/%d], Step [%d/%d], Mel Loss: %.5f, Gen Loss: %.5f, Disc Loss: %.5f, Mono Loss: %.5f, S2S Loss: %.5f, SLM Loss: %.5f'
+                              % (epoch+1, epochs, i+1, len(train_dataloader), mel_avg, loss_gen_all, d_loss, loss_mono, loss_s2s, loss_slm), logger)
 
-                    writer.add_scalar('train/mel_loss', running_loss / log_interval, iters)
+                    writer.add_scalar('train/mel_loss', mel_avg, iters)
                     writer.add_scalar('train/gen_loss', loss_gen_all, iters)
                     writer.add_scalar('train/d_loss', d_loss, iters)
                     writer.add_scalar('train/mono_loss', loss_mono, iters)
@@ -386,153 +337,127 @@ def main(config_path):
                     writer.add_scalar('train/slm_loss', loss_slm, iters)
 
                     running_loss = 0
+                    n_running = 0
 
                     print('Time elasped:', time.time()-start_time)
 
             except RuntimeError as e:
-                if 'out of memory' in str(e).lower():
-                    log_print('WARNING: OOM at step %d, skipping batch' % i, logger)
-                    _bin = None
-                    if mel_input_length is not None:
-                        _bin = get_bin_from_mel_input_length(mel_input_length)
-                    # Drop iter-local refs so the partial autograd graph is
-                    # released NOW rather than living on into the next iter
-                    # (which is what causes the repeat-OOM spiral).
-                    del waves, batch, texts, input_lengths, mels, mel_input_length
-                    del mask, text_mask, attn_mask
-                    del ppgs, s2s_pred, s2s_attn, mask_ST, s2s_attn_mono
-                    del t_en, asr, mel_input_length_all
-                    del en, gt, wav, st, real_norm, F0_real, s, y_rec
-                    del d_loss, loss_mel, loss_s2s, loss_mono
-                    del loss_gen_all, loss_slm, g_loss
-                    optimizer.zero_grad()
-                    import gc
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    if dynamic_batch and batch_manager is not None and _bin is not None:
-                        if batch_manager.decrement(_bin):
-                            log_print('Reduced batch size for bin %d to %d' % (
-                                _bin, batch_manager.get(_bin)), logger)
-                else:
+                if not is_oom(e):
                     raise
-                                
-        loss_test = 0
-
-        _ = [model[key].eval() for key in model]
-
-        with torch.no_grad():
-            iters_test = 0
-            for batch_idx, batch in enumerate(val_dataloader):
+                if world > 1:
+                    raise RuntimeError(
+                        'CUDA out of memory in multi-GPU training. OOM recovery only '
+                        'works in a single process (the other ranks would hang); '
+                        'lower max_batch_frames, or run one epoch on a single GPU '
+                        'first so batch_sizes_1st.json learns sizes that fit.') from e
+                bin_id = get_bin_from_mel_input_length(mel_input_length) if mel_input_length is not None else None
+                log_print('WARNING: OOM at step %d (bin %s), skipping batch' % (i, bin_id), logger)
+                # Release the partial graph before the next batch allocates.
+                batch = waves = mels = texts = None
+                ppgs = s2s_pred = s2s_attn = s2s_attn_mono = t_en = asr = None
+                en = gt = wav = st = s = y_rec = F0_real = real_norm = None
+                d_loss = loss_mel = loss_s2s = loss_mono = loss_gen_all = loss_slm = g_loss = None
                 optimizer.zero_grad()
+                amp._unscaled.clear()
+                free_memory()
+                if batch_manager is not None and bin_id is not None:
+                    batch_manager.on_oom(bin_id, bs)
 
-                waves = batch[0]
-                batch = [b.to(device) for b in batch[1:]]
-                texts, input_lengths, _, _, mels, mel_input_length, _ = batch
+        if n_skipped and is_main:
+            log_print('Epoch %d: %d steps had non-finite losses and were not applied' % (epoch + 1, n_skipped), logger)
 
-                with torch.no_grad():
-                    mask = length_to_mask(mel_input_length // (2 ** n_down)).to('cuda')
-                    ppgs, s2s_pred, s2s_attn = model.text_aligner(mels, mask, texts)
+        # ------------------------------------------------------------------
+        # Validation (main process, bare modules, whole utterances)
+        # ------------------------------------------------------------------
+        accelerator.wait_for_everyone()
+        if is_main:
+            loss_test = 0
+            iters_test = 0
+            _ = [raw[key].eval() for key in raw]
+            samples = []
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(val_dataloader):
+                    waves = batch[0]
+                    batch = [b.to(device) for b in batch[1:]]
+                    texts, input_lengths, _, _, mels, mel_input_length, _ = batch
 
+                    mask = length_to_mask(mel_input_length // (2 ** n_down)).to(device)
+                    text_mask = length_to_mask(input_lengths).to(device)
+                    with amp.autocast():
+                        ppgs, s2s_pred, s2s_attn = raw.text_aligner(mels, mask, texts)
                     s2s_attn = s2s_attn.transpose(-1, -2)
                     s2s_attn = s2s_attn[..., 1:]
                     s2s_attn = s2s_attn.transpose(-1, -2)
-
-                    text_mask = length_to_mask(input_lengths).to(texts.device)
                     attn_mask = (~mask).unsqueeze(-1).expand(mask.shape[0], mask.shape[1], text_mask.shape[-1]).float().transpose(-1, -2)
                     attn_mask = attn_mask.float() * (~text_mask).unsqueeze(-1).expand(text_mask.shape[0], text_mask.shape[1], mask.shape[-1]).float()
                     attn_mask = (attn_mask < 1)
-                    s2s_attn.masked_fill_(attn_mask, 0.0)
+                    s2s_attn = s2s_attn.masked_fill(attn_mask, 0.0)
 
-                # encode
-                t_en = model.text_encoder(texts, input_lengths, text_mask)
-                
-                asr = (t_en @ s2s_attn)
+                    with amp.autocast():
+                        t_en = raw.text_encoder(texts, input_lengths, text_mask)
+                        asr = (t_en @ s2s_attn.to(t_en.dtype))
 
-                # get clips
-                mel_input_length_all = accelerator.gather(mel_input_length) # for balanced load
-                mel_len = min([int(mel_input_length.min().item() / 2 - 1), max_len // 2])
-                
-                en = []
-                gt = []
-                wav = []
-                for bib in range(len(mel_input_length)):
-                    mel_length = int(mel_input_length[bib].item() / 2)
+                    en, gt, wav, _, _ = select_segments(asr, mels, waves, mel_input_length,
+                                                        None, device, full_length=True)
+                    if gt.shape[-1] < 80:
+                        continue
 
-                    random_start = np.random.randint(0, mel_length - mel_len)
-                    en.append(asr[bib, :, random_start:random_start+mel_len])
-                    gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
-                    y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
-                    wav.append(torch.from_numpy(y).to('cuda'))
+                    with amp.autocast():
+                        F0_real, _, F0 = raw.pitch_extractor(gt.unsqueeze(1))
+                        s = raw.style_encoder(gt.unsqueeze(1))
+                        real_norm = log_norm(gt.unsqueeze(1)).squeeze(1)
+                        y_rec = raw.decoder(en, F0_real, real_norm, s)
 
-                wav = torch.stack(wav).float().detach()
+                    loss_mel = stft_loss(y_rec, wav)
+                    if not all_finite(loss_mel):
+                        continue
+                    loss_test += loss_mel.item()
+                    iters_test += 1
+                    if len(samples) < 7:
+                        samples.append((y_rec.float().cpu().numpy().squeeze(), waves[0],
+                                        s2s_attn[0].float().cpu().numpy()))
 
-                en = torch.stack(en)
-                gt = torch.stack(gt).detach()
-
-                F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1))
-                s = model.style_encoder(gt.unsqueeze(1))
-                real_norm = log_norm(gt.unsqueeze(1)).squeeze(1)
-                y_rec = model.decoder(en, F0_real, real_norm, s)
-
-                loss_mel = stft_loss(y_rec.squeeze(1), wav.detach())
-
-                loss_test += accelerator.gather(loss_mel).mean().item()
-                iters_test += 1
-
-        if accelerator.is_main_process:
+            loss_test = loss_test / max(1, iters_test)
             print('Epochs:', epoch + 1)
-            log_print('Validation loss: %.3f' % (loss_test / iters_test) + '\n\n\n\n', logger)
+            log_print('Validation loss: %.3f' % loss_test + '\n\n\n\n', logger)
             print('\n\n\n')
-            writer.add_scalar('eval/mel_loss', loss_test / iters_test, epoch + 1)
-            attn_image = get_image(s2s_attn[0].cpu().numpy().squeeze())
-            writer.add_figure('eval/attn', attn_image, epoch)
-            
-            with torch.no_grad():
-                for bib in range(len(asr)):
-                    mel_length = int(mel_input_length[bib].item())
-                    gt = mels[bib, :, :mel_length].unsqueeze(0)
-                    en = asr[bib, :, :mel_length // 2].unsqueeze(0)
-                                        
-                    F0_real, _, _ = model.pitch_extractor(gt.unsqueeze(1))
-                    s = model.style_encoder(gt.unsqueeze(1))
-                    real_norm = log_norm(gt.unsqueeze(1)).squeeze(1)
-                    
-                    y_rec = model.decoder(en, F0_real, real_norm, s)
-                    
-                    writer.add_audio('eval/y' + str(bib), y_rec.cpu().numpy().squeeze(), epoch, sample_rate=sr)
-                    if epoch == 0:
-                        writer.add_audio('gt/y' + str(bib), waves[bib].squeeze(), epoch, sample_rate=sr)
-                    
-                    if bib >= 6:
-                        break
+            writer.add_scalar('eval/mel_loss', loss_test, epoch + 1)
+            if samples:
+                writer.add_figure('eval/attn', get_image(samples[0][2]), epoch)
+            for bib, (y, y_gt, _) in enumerate(samples):
+                writer.add_audio('eval/y' + str(bib), y, epoch, sample_rate=sr)
+                if epoch == 0:
+                    writer.add_audio('gt/y' + str(bib), y_gt.squeeze(), epoch, sample_rate=sr)
 
             if epoch % saving_epoch == 0:
-                if (loss_test / iters_test) < best_loss:
-                    best_loss = loss_test / iters_test
+                if loss_test < best_loss:
+                    best_loss = loss_test
                 print('Saving..')
                 state = {
-                    'net':  {key: model[key].state_dict() for key in model}, 
+                    'net':  {key: raw[key].state_dict() for key in raw},
                     'optimizer': optimizer.state_dict(),
+                    'amp_scaler': amp.state_dict(),
                     'iters': iters,
-                    'val_loss': loss_test / iters_test,
+                    'val_loss': loss_test,
                     'epoch': epoch,
                 }
                 save_path = osp.join(log_dir, 'epoch_1st_%05d.pth' % epoch)
                 torch.save(state, save_path)
-                                
-    if accelerator.is_main_process:
+        accelerator.wait_for_everyone()
+
+    if is_main:
         print('Saving..')
         state = {
-            'net':  {key: model[key].state_dict() for key in model}, 
+            'net':  {key: raw[key].state_dict() for key in raw},
             'optimizer': optimizer.state_dict(),
+            'amp_scaler': amp.state_dict(),
             'iters': iters,
-            'val_loss': loss_test / iters_test,
-            'epoch': epoch,
+            'val_loss': loss_test,
+            'epoch': epochs - 1,
         }
         save_path = osp.join(log_dir, config.get('first_stage_path', 'first_stage.pth'))
         torch.save(state, save_path)
 
-        
-    
+
 if __name__=="__main__":
     main()

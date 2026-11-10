@@ -43,6 +43,13 @@ sudo apt-get install espeak-ng
 For LibriTTS, you will need to combine train-clean-360 with train-clean-100 and rename the folder train-clean-460 (see [val_list_libritts.txt](https://github.com/yl4579/StyleTTS/blob/main/Data/val_list_libritts.txt) as an example).
 
 ## Training
+
+### What differs from the original training code
+- **No cross-sample cropping (dynamic batching, on by default).** The original code crops every utterance of a random batch to the shortest one, so segments get shorter and more random as the batch grows. Now utterances are grouped into 0.25 s length bins, padded to the bin length and batched per bin, and the whole utterance is used. Batch size per bin = `max_batch_frames // bin_frames` (default `batch_size * max_len`). Batch sizes that OOM shrink automatically and sizes that fit grow back, per training phase, and are stored in `log_dir/batch_sizes_<stage>.json` for later runs. Validation uses batch size 1 on whole utterances, so it is deterministic. `dynamic_batch: false` restores the original behaviour.
+- **Memory / speed:** `mixed_precision` (`bf16`, or `fp16` with a correct multi-optimizer GradScaler) in every script, `gradient_checkpointing` for the decoder and diffusion model, `use_8bit_optimizer`, batched style encoding, vectorised duration/alignment losses, no gradients for modules that are not updated in the current phase, TF32.
+- **Stability fixes:** first-stage weights silently not loaded into the second stage on a single GPU (NaN from step 0, [#254](https://github.com/yl4579/StyleTTS2/issues/254)); NaN from the TPRLS loss; non-finite steps skipped instead of dropping into a debugger; optional per-module `grad_clip_norm`; texts longer than PL-BERT's 512 positions dropped instead of crashing; SLM adversarial training no longer skipped for batches of 1-2 utterances; `sigma_data` no longer written as NaN; `joint_epoch < diff_epoch` crash fixed; batch size 1 works everywhere.
+- `train_finetune.py` and `train_finetune_accelerate.py` run the same code as `train_second.py` (with the fine-tuning differences), so every fix applies to all stages.
+
 First stage training:
 ```bash
 accelerate launch train_first.py --config_path ./Configs/config.yml
@@ -59,7 +66,7 @@ The data list format needs to be `filename.wav|transcription|speaker`, see [val_
 In [config.yml](https://github.com/yl4579/StyleTTS2/blob/main/Configs/config.yml), there are a few important configurations to take care of:
 - `OOD_data`: The path for out-of-distribution texts for SLM adversarial training. The format should be `text|anything`.
 - `min_length`: Minimum length of OOD texts for training. This is to make sure the synthesized speech has a minimum length.
-- `max_len`: Maximum length of audio for training. The unit is frame. Since the default hop size is 300, one frame is approximately `300 / 24000` (0.0125) second. Lowering this if you encounter the out-of-memory issue. 
+- `max_len`: Maximum length of audio for training. The unit is frame. Since the default hop size is 300, one frame is approximately `300 / 24000` (0.0125) second. With `dynamic_batch` it only sets the default `max_batch_frames` (`batch_size * max_len`); use `max_batch_frames` (and optionally `max_segment_len`) to control memory. 
 - `multispeaker`: Set to true if you want to train a multispeaker model. This is needed because the architecture of the denoiser is different for single and multispeaker models.
 - `batch_percentage`: This is to make sure during SLM adversarial training there are no out-of-memory (OOM) issues. If you encounter OOM problem, please set a lower number for this. 
 
@@ -71,7 +78,7 @@ In [Utils](https://github.com/yl4579/StyleTTS2/tree/main/Utils) folder, there ar
 
 ### Common Issues
 - **Loss becomes NaN**: If it is the first stage, please make sure you do not use mixed precision, as it can cause loss becoming NaN for some particular datasets when the batch size is not set properly (need to be more than 16 to work well). For the second stage, please also experiment with different batch sizes, with higher batch sizes being more likely to cause NaN loss values. We recommend the batch size to be 16. You can refer to issues [#10](https://github.com/yl4579/StyleTTS2/issues/10) and [#11](https://github.com/yl4579/StyleTTS2/issues/11) for more details.
-- **Out of memory**: Please either use lower `batch_size` or `max_len`. You may refer to issue [#10](https://github.com/yl4579/StyleTTS2/issues/10) for more information.
+- **Out of memory**: With `dynamic_batch` the batch sizes adapt automatically; lower `max_batch_frames`, or enable `mixed_precision`/`gradient_checkpointing`. Without it, use lower `batch_size` or `max_len`. Multi-GPU (DDP) runs of `train_first.py` cannot recover from OOM; run an epoch on one GPU first so the learned batch sizes are saved.
 - **Non-English dataset**: You can train on any language you want, but you will need to use a pre-trained PL-BERT model for that language. We have a pre-trained [multilingual PL-BERT](https://huggingface.co/papercup-ai/multilingual-pl-bert) that supports 14 languages. You may refer to [yl4579/StyleTTS#10](https://github.com/yl4579/StyleTTS/issues/10) and [#70](https://github.com/yl4579/StyleTTS2/issues/70) for some examples to train on Chinese datasets. 
 
 ## Finetuning
